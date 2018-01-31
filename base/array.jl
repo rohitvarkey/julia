@@ -691,7 +691,17 @@ function setindex! end
 @eval setindex!(A::Array{T}, x, i1::Int, i2::Int, I::Int...) where {T} =
     (@_inline_meta; arrayset($(Expr(:boundscheck)), A, convert(T,x)::T, i1, i2, I...))
 
-# Faster contiguous setindex! with copyto!
+# These are redundant with the abstract fallbacks but needed for bootstrap
+function setindex!(A::Array, x, I::AbstractVector{Int})
+    @_propagate_inbounds_meta
+    A === I && (I = copy(I))
+    for i in I
+        A[i] = x
+    end
+    return A
+end
+
+# Faster contiguous setindex! with copyto! TODO: Transform to Broadcasts impls
 # function setindex!(A::Array{T}, X::Array{T}, I::UnitRange{Int}) where T
 #     @_inline_meta
 #     @boundscheck checkbounds(A, I)
@@ -711,9 +721,9 @@ function setindex! end
 #     end
 #     return A
 # end
-# 
-# setindex!(A::Array, x::Number, ::Colon) = fill!(A, x)
-# setindex!(A::Array{T, N}, x::Number, ::Vararg{Colon, N}) where {T, N} = fill!(A, x)
+
+setindex!(A::Array, x::Number, ::Colon) = fill!(A, x)
+setindex!(A::Array{T, N}, x::Number, ::Vararg{Colon, N}) where {T, N} = fill!(A, x)
 
 # efficiently grow an array
 
