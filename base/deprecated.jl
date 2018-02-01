@@ -574,18 +574,19 @@ end
 
 # issue #...: nonscalar indexed assignment of many values to many locations
 function deprecate_nonscalar_indexed_assignment!(A::AbstractArray, X::AbstractArray, I...)
-    if ndims(A) == ndims(X)
+    shape = Base.index_shape(I...)
+    if shape == axes(X)
         depwarn("using `A[I...] = X` to implicitly broadcast the elements of `X` to many locations in `A` is deprecated. Use `A[I...] .= X` to explicitly opt-in to broadcasting.", :setindex!)
         A[I...] .= X
     else
-        depwarn("using `A[I...] = X` to implicitly broadcast the elements of `X` to many locations in `A` is deprecated. Use `A[I...] .= reshape(X, indices(view(A, I...)))` to explicitly opt-in to broadcasting.", :setindex!)
-        A[I...] .= reshape(X, indices(view(A, I...)))
+        depwarn("using `A[I...] = X` to implicitly broadcast the elements of `X` to many locations in `A` is deprecated. Use `A[I...] .= reshape(X, axes(view(A, I...)))` to explicitly opt-in to broadcasting.", :setindex!)
+        A[I...] .= reshape(X, shape)
     end
 end
 _unsafe_setindex!(::IndexStyle, A::AbstractArray, X::AbstractArray, I::Union{Real,AbstractArray}...) = deprecate_nonscalar_indexed_assignment!(A, X, I...)
-setindex!(B::BitArray, X::StridedArray, J0::Union{Colon,UnitRange{Int}}) = deprecate_nonscalar_indexed_assignment(B, X, J0)
-setindex!(B::BitArray, X::StridedArray, I0::Union{Colon,UnitRange{Int}}, I::Union{Int,UnitRange{Int},Colon}...) = deprecate_nonscalar_indexed_assignment(B, X, I0, I)
-setindex!(A::Array, X::AbstractArray, I::AbstractVector{Int}) = deprecate_nonscalar_indexed_assignment(A, X, I)
+setindex!(B::BitArray, X::StridedArray, J0::Union{Colon,UnitRange{Int}}) = deprecate_nonscalar_indexed_assignment!(B, X, J0)
+setindex!(B::BitArray, X::StridedArray, I0::Union{Colon,UnitRange{Int}}, I::Union{Int,UnitRange{Int},Colon}...) = deprecate_nonscalar_indexed_assignment!(B, X, I0, I)
+setindex!(A::Array, X::AbstractArray, I::AbstractVector{Int}) = deprecate_nonscalar_indexed_assignment!(A, X, I)
 
 # issue #22791
 @deprecate select partialsort

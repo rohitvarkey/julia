@@ -1167,7 +1167,7 @@ function typed_hcat(::Type{T}, A::AbstractVecOrMat...) where T
         for k=1:nargs
             Ak = A[k]
             p1 = pos+(isa(Ak,AbstractMatrix) ? size(Ak, 2) : 1)-1
-            B[:, pos:p1] = Ak
+            B[:, pos:p1] .= Ak
             pos = p1+1
         end
     end
@@ -1191,7 +1191,7 @@ function typed_vcat(::Type{T}, A::AbstractVecOrMat...) where T
     for k=1:nargs
         Ak = A[k]
         p1 = pos+size(Ak,1)-1
-        B[pos:p1, :] = Ak
+        B[pos:p1, :] .= Ak
         pos = p1+1
     end
     return B
