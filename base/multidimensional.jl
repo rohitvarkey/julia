@@ -1452,8 +1452,7 @@ function copy_to_bitarray_chunks!(Bc::Vector{UInt64}, pos_d::Int, C::StridedArra
     end
 end
 
-# These had been specializations on setindex! previously
-# contiguous multidimensional indexing: if the first dimension is a range,
+# contiguous multidimensional B[] .= indexing: if the first index is a range,
 # we can get some performance from using copy_chunks!
 function broadcast!(::typeof(identity), B::BitArray, X::StridedArray)
     size(B) == size(X) || return Broadcast._broadcast!(identity, B, X)
@@ -1463,7 +1462,7 @@ end
 function broadcast!(::typeof(identity), V::SubArray{<:Any,<:Any,<:BitArray,<:Tuple{AbstractUnitRange}}, X::StridedArray)
     size(V) == size(X) || return Broadcast._broadcast!(identity, V, X)
     B = V.parent
-    I0 = V.indexes[1]
+    I0 = V.indices[1]
     l0 = length(I0)
     l0 == 0 && return B
     f0 = indexoffset(I0)+1
@@ -1471,13 +1470,13 @@ function broadcast!(::typeof(identity), V::SubArray{<:Any,<:Any,<:BitArray,<:Tup
     return B
 end
 @generated function broadcast!(::typeof(identity),
-        V::SubArray{<:Any,<:Any,<:BitArray,<:Tuple{AbstractUnitRange,Vararg{Union{AbstractUnitRange,Int}}}}, X::StridedArray)
-    N = length(I)
+        V::SubArray{<:Any,<:Any,<:BitArray,VI}, X::StridedArray) where VI<:Tuple{AbstractUnitRange,Vararg{Union{AbstractUnitRange,Int}}}
+    N = length(VI.parameters)-1
     quote
         size(V) == size(X) || return Broadcast._broadcast!(identity, V, X)
         B = V.parent
-        I0 = V.indexes[1]
-        I = tail(V.indexes)
+        I0 = V.indices[1]
+        I = tail(V.indices)
         idxlens = @ncall $N index_lengths I0 d->I[d]
         isempty(X) && return B
         f0 = indexoffset(I0)+1

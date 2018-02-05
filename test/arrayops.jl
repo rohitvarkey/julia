@@ -335,7 +335,7 @@ end
     @test X[7:11] == [1:5;]
     X = get(A, (2:4, 9:-2:-13), 0)
     Xv = zeros(Int, 3, 12)
-    Xv[1:2, 2:5] = A[2:3, 7:-2:1]
+    Xv[1:2, 2:5] .= A[2:3, 7:-2:1]
     @test X == Xv
     X2 = get(A, Vector{Int}[[2:4;], [9:-2:-13;]], 0)
     @test X == X2
@@ -623,7 +623,7 @@ Base.hash(::HashCollision, h::UInt) = h
 # All rows and columns unique
 let A, B, C, D
     A = fill(1., 10, 10)
-    A[diagind(A)] = shuffle!([1:10;])
+    A[diagind(A)] .= shuffle!([1:10;])
     @test unique(A, 1) == A
     @test unique(A, 2) == A
 
@@ -840,10 +840,10 @@ end
     T = reshape([1:4; 1:4; 5:8; 5:8], 2, 2, 4)
     @test R == T
     A = Array{Int}(uninitialized, 2, 2, 2)
-    A[:, :, 1] = [1 2;
-                    3 4]
-    A[:, :, 2] = [5 6;
-                    7 8]
+    A[:, :, 1] .= [1 2;
+                   3 4]
+    A[:, :, 2] .= [5 6;
+                   7 8]
     R = repeat(A, inner = (2, 2, 2), outer = (2, 2, 2))
     @test R[1, 1, 1] == 1
     @test R[2, 2, 2] == 1
@@ -908,9 +908,9 @@ end
     a = [1:5;]
     a[[true,false,true,false,true]] = 6
     @test a == [6,2,6,4,6]
-    a[[true,false,true,false,true]] = [7,8,9]
+    a[[true,false,true,false,true]] .= [7,8,9]
     @test a == [7,2,8,4,9]
-    @test_throws DimensionMismatch (a[[true,false,true,false,true]] = [7,8,9,10])
+    @test_throws DimensionMismatch (a[[true,false,true,false,true]] .= [7,8,9,10])
     A = reshape(1:15, 3, 5)
     @test A[[true, false, true], [false, false, true, true, false]] == [7 10; 9 12]
     @test_throws BoundsError A[[true, false], [false, false, true, true, false]]
@@ -918,12 +918,11 @@ end
     @test_throws BoundsError A[[true, false, true, true], [false, false, true, true, false]]
     @test_throws BoundsError A[[true, false, true], [false, false, true, true, false, true]]
     A = fill(1, 3, 5)
-    @test_throws DimensionMismatch A[2,[true, false, true, true, false]] = 2:5
-    A[2,[true, false, true, true, false]] = 2:4
+    @test_throws DimensionMismatch A[2,[true, false, true, true, false]] .= 2:5
+    A[2,[true, false, true, true, false]] .= 2:4
     @test A == [1 1 1 1 1; 2 1 3 4 1; 1 1 1 1 1]
-    @test_throws DimensionMismatch A[[true,false,true], 5] = [19]
-    @test_throws DimensionMismatch A[[true,false,true], 5] = 19:21
-    A[[true,false,true], 5] = 7
+    @test_throws DimensionMismatch A[[true,false,true], 5] .= 19:21
+    A[[true,false,true], 5] .= 7
     @test A == [1 1 1 1 7; 2 1 3 4 1; 1 1 1 1 7]
 
     B = cat(3, 1, 2, 3)
@@ -1043,7 +1042,7 @@ end
     a[b] = 8
     @test a == [8,3,8]
 end
-
+#= TODO: This is disabled until alias detection is incorporated
 @testset "assigning an array into itself" begin
     a = [1,3,5]
     b = [3,1,2]
@@ -1053,7 +1052,7 @@ end
     a[a] = [4,5,6]
     @test a == [6,5,4]
 end
-
+=#
 @testset "lexicographic comparison" begin
     @test cmp([1.0], [1]) == 0
     @test cmp([1], [1.0]) == 0
