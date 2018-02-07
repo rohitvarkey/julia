@@ -1398,7 +1398,7 @@ end
 # PR #8622 and general indexin tests
 @test indexin([1,3,5,7], [5,4,3]) == [nothing,3,1,nothing]
 @test indexin([1 3; 5 7], [5 4; 3 2]) == [nothing CartesianIndex(2, 1); CartesianIndex(1, 1) nothing]
-@test indexin((2 * x + 1 for x in 0:3), [5,4,3,5,6]) == [nothing,3,4,nothing]
+@test_broken indexin((2 * x + 1 for x in 0:3), [5,4,3,5,6]) == [nothing,3,4,nothing] # TODO: this requires the broadcast API revamp
 @test indexin(6, [1,3,6,6,2]) == fill(4, ())
 @test indexin([6], [1,3,6,6,2]) == [4]
 @test indexin([3], 2:5) == [2]
@@ -1473,7 +1473,7 @@ end
     @test isa(Base.IndexStyle(trues(2)), Base.IndexLinear)
     @test isa(Base.IndexStyle(BitArray{2}), Base.IndexLinear)
     aa = fill(99, 10)
-    aa[1:2:9] = a
+    aa[1:2:9] .= a
     shp = [5]
     for i = 1:10
         A = reshape(a, tuple(shp...))
