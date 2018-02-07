@@ -86,7 +86,7 @@
 #include <polly/RegisterPasses.h>
 #include <polly/ScopDetection.h>
 #endif
-#include <llvm/ExecutionEngine/ExecutionEngine.h>
+#include <llvm/Target/TargetMachine.h>
 
 using namespace llvm;
 namespace llvm {
@@ -158,20 +158,18 @@ extern void _chkstk(void);
 
 #define DISABLE_FLOAT16
 
-// llvm state
-JL_DLLEXPORT LLVMContext jl_LLVMContext;
-TargetMachine *jl_TargetMachine;
-
 extern JITEventListener *CreateJuliaJITEventListener();
 
 // for image reloading
 bool imaging_mode = false;
 
+// shared llvm state
+static LLVMContext jl_LLVMContext;
+TargetMachine *jl_TargetMachine;
 Module *shadow_output;
+static DataLayout jl_data_layout("");
 #define jl_Module ctx.f->getParent()
 #define jl_builderModule(builder) (builder).GetInsertBlock()->getParent()->getParent()
-
-static DataLayout jl_data_layout("");
 
 // types
 static Type *T_jlvalue;
@@ -538,6 +536,7 @@ public:
     Value *world_age_field = NULL;
 
     bool debug_enabled = false;
+    bool use_cache = false;
     const jl_cgparams_t *params = NULL;
 
     jl_codectx_t(LLVMContext &llvmctx, jl_codegen_call_targets_t *call_targets=NULL)
@@ -2558,6 +2557,8 @@ static jl_cgval_t emit_invoke(jl_codectx_t &ctx, jl_expr_t *ex)
     if (lival.constant) {
         li = (jl_method_instance_t*)lival.constant;
         assert(jl_is_method_instance(li));
+        assert((li->min_world <= ctx.linfo->min_world && li->max_world >= ctx.linfo->max_world) ||
+               (ctx.linfo->min_world == 0 && ctx.linfo->max_world == 0));
         if (li->jlcall_api == JL_API_CONST) {
             assert(li->inferred_const);
             return mark_julia_const(li->inferred_const);
@@ -2582,7 +2583,7 @@ static jl_cgval_t emit_invoke(jl_codectx_t &ctx, jl_expr_t *ex)
             std::string name;
             StringRef protoname;
             bool need_to_emit = true;
-            if (ctx.params->cached) {
+            if (ctx.use_cache) {
                 // optimization: emit the correct name immediately, if we know it
                 if (specsig) {
                     if (li->fptr_specsig) {
@@ -4348,6 +4349,7 @@ static std::pair<std::unique_ptr<Module>, jl_llvm_functions_t>
         jl_code_info_t *src,
         size_t world,
         jl_codegen_call_targets_t *workqueue,
+        bool use_cache,
         const jl_cgparams_t *params)
 {
     // step 1. unpack AST and allocate codegen context for this function
@@ -4367,6 +4369,7 @@ static std::pair<std::unique_ptr<Module>, jl_llvm_functions_t>
     ctx.world = world;
     ctx.name = name_from_method_instance(lam);
     ctx.funcName = ctx.name;
+    ctx.use_cache = use_cache;
     ctx.params = params;
     ctx.spvals_ptr = NULL;
     ctx.nargs = jl_is_method(lam->def.method) ? lam->def.method->nargs : 0;
@@ -5413,8 +5416,7 @@ static int32_t jl_jlcall_api(StringRef fname)
     return JL_API_GENERIC;
 }
 
-std::tuple<std::unique_ptr<Module>, jl_llvm_functions_t, jl_value_t*, uint8_t>
-    jl_compile_linfo1(
+jl_compile_result_t jl_compile_linfo1(
         jl_method_instance_t *li,
         jl_code_info_t *src,
         size_t world,
@@ -5431,7 +5433,7 @@ std::tuple<std::unique_ptr<Module>, jl_llvm_functions_t, jl_value_t*, uint8_t>
         compare_cgparams(params, &jl_default_cgparams)) &&
         "functions compiled with custom codegen params must not be cached");
     JL_TRY {
-        std::tie(m, decls) = emit_function(li, src, world, &workqueue, params);
+        std::tie(m, decls) = emit_function(li, src, world, &workqueue, cache, params);
     }
     JL_CATCH {
         // Something failed! This is very, very bad.
@@ -5487,6 +5489,92 @@ std::tuple<std::unique_ptr<Module>, jl_llvm_functions_t, jl_value_t*, uint8_t>
     return std::make_tuple(std::move(m), decls, li->rettype, jl_jlcall_api(decls.functionObject));
 }
 
+void jl_compile_workqueue(
+    size_t world,
+    bool cache,
+    std::map<jl_method_instance_t *, jl_compile_result_t> &emitted,
+    jl_codegen_call_targets_t &workqueue)
+{
+    jl_code_info_t *src = NULL;
+    JL_GC_PUSH1(&src);
+    while (!workqueue.empty()) {
+        jl_llvm_functions_t decls = {};
+        jl_method_instance_t *li;
+        Function *protodecl;
+        jl_returninfo_t::CallingConv proto_cc;
+        bool proto_specsig;
+        jl_value_t *proto_rettype;
+        std::tie(li, proto_cc, protodecl, proto_rettype, proto_specsig) = workqueue.back();
+        workqueue.pop_back();
+        // try to emit code for this item from the workqueue
+        jl_value_t *rettype = li->rettype;
+        if (li->min_world > world || li->max_world < world) {
+            // assert(0);
+        }
+        else if (cache && li->fptr && li->jlcall_api == JL_API_GENERIC) {
+
+            decls.functionObject = jl_ExecutionEngine->getFunctionAtAddress((uint64_t)(uintptr_t)li->fptr, li);
+            if (li->fptr_specsig)
+                decls.specFunctionObject = jl_ExecutionEngine->getFunctionAtAddress((uint64_t)(uintptr_t)li->fptr_specsig, li);
+        }
+        else {
+            jl_compile_result_t &result = emitted[li];
+            if (std::get<0>(result)) {
+                decls = std::get<1>(result);
+                rettype = std::get<2>(result);
+            }
+            else {
+                src = (jl_code_info_t*)li->inferred;
+                if (src && (jl_value_t*)src != jl_nothing) {
+                    if (jl_is_method(li->def.method))
+                        src = jl_uncompress_ast(li->def.method, (jl_array_t*)src);
+                    if (jl_is_code_info(src)) {
+                        result = jl_compile_linfo1(li, src, world, workqueue, cache, &jl_default_cgparams);
+                    }
+                }
+                if (std::get<0>(result)) {
+                    decls = std::get<1>(result);
+                    rettype = std::get<2>(result);
+                }
+                else {
+                    emitted.erase(li);
+                }
+            }
+        }
+        // patch up the prototype we emitted earlier
+        Module *mod = protodecl->getParent();
+        StringRef preal_decl = "";
+        assert(protodecl->isDeclaration());
+        if (proto_specsig) {
+            preal_decl = decls.specFunctionObject;
+            if (proto_rettype != rettype || preal_decl.empty()) {
+                protodecl->setLinkage(GlobalVariable::PrivateLinkage);
+                protodecl->addFnAttr("no-frame-pointer-elim", "true");
+                size_t nargs = jl_nparams(li->specTypes); // number of actual arguments being passed
+                emit_cfunc_invalidate(protodecl, proto_cc, li->specTypes, proto_rettype, nargs, world);
+                preal_decl = "";
+            }
+        }
+        else {
+            preal_decl = decls.functionObject;
+            if (preal_decl.empty()) {
+                // TODO: generate an indirect call to li->fptr1 trampoline
+                preal_decl = "jl_apply_2va";
+            }
+        }
+        if (!preal_decl.empty()) {
+            if (Value *specfun = mod->getNamedValue(preal_decl)) {
+                if (protodecl != specfun)
+                    protodecl->replaceAllUsesWith(specfun);
+            }
+            else {
+                protodecl->setName(preal_decl);
+            }
+        }
+    }
+    JL_GC_POP();
+}
+
 // --- native code info, and dump function to IR and ASM ---
 // Get pointer to llvm::Function instance, compiling if necessary
 // for use in reflection from Julia.
@@ -5518,16 +5606,16 @@ void *jl_get_llvmf_defn(jl_method_instance_t *linfo, size_t world, char getwrapp
     // emit this function into a new module
     if (src && jl_is_code_info(src)) {
         jl_codegen_call_targets_t workqueue;
+        Function *F = NULL;
         std::unique_ptr<Module> m;
         jl_llvm_functions_t decls;
         jl_value_t *rettype;
         uint8_t api;
+        JL_LOCK(&codegen_lock);
         std::tie(m, decls, rettype, api) = jl_compile_linfo1(linfo, src, world, workqueue, false, &params);
-        JL_GC_POP();
 
         if (m) {
             // if compilation succeeded, prepare to return the result
-            JL_LOCK(&codegen_lock);
             const std::string *fname;
             if (!getwrapper && !decls.specFunctionObject.empty())
                 fname = &decls.specFunctionObject;
@@ -5535,11 +5623,13 @@ void *jl_get_llvmf_defn(jl_method_instance_t *linfo, size_t world, char getwrapp
                 fname = &decls.functionObject;
             if (optimize)
                 jl_globalPM->run(*m.get());
-            Function *F = cast<Function>(m->getNamedValue(*fname));
+            F = cast<Function>(m->getNamedValue(*fname));
             m.release(); // the return object `llvmf` will be the owning pointer
-            JL_UNLOCK(&codegen_lock); // Might GC
-            return F;
         }
+        JL_GC_POP();
+        JL_UNLOCK(&codegen_lock); // Might GC
+        if (F)
+            return F;
     }
 
     jl_errorf("unable to compile source for function %s", mname);
@@ -5716,7 +5806,6 @@ static void init_julia_llvm_env(Module *m)
     four_pvalue_llvmt.push_back(T_pjlvalue);
     four_pvalue_llvmt.push_back(T_pjlvalue);
     V_null = Constant::getNullValue(T_pjlvalue);
-    jl_init_jit(T_pjlvalue);
 
     std::vector<Type*> ftargs(0);
     ftargs.push_back(T_pprjlvalue); // linfo->sparam_vals
@@ -6230,13 +6319,9 @@ static void init_julia_llvm_env(Module *m)
                            false, GlobalVariable::ExternalLinkage,
                            NULL, "jl_world_counter");
     add_named_global(jlgetworld_global, &jl_world_counter);
-
-    jl_globalPM = new legacy::PassManager();
-    addTargetPasses(jl_globalPM, jl_TargetMachine);
-    addOptimizationPasses(jl_globalPM, jl_options.opt_level);
 }
 
-extern "C" void *jl_init_llvm(void)
+extern "C" void jl_init_llvm(void)
 {
     const char *const argv_tailmerge[] = {"", "-enable-tail-merge=0"}; // NOO TOUCHIE; NO TOUCH! See #922
     cl::ParseCommandLineOptions(sizeof(argv_tailmerge)/sizeof(argv_tailmerge[0]), argv_tailmerge, "disable-tail-merge\n");
@@ -6263,11 +6348,6 @@ extern "C" void *jl_init_llvm(void)
     InitializeNativeTargetAsmParser();
     InitializeNativeTargetDisassembler();
 
-    Module *m, *engine_module;
-    engine_module = new Module("julia", jl_LLVMContext);
-    m = new Module("julia", jl_LLVMContext);
-    shadow_output = m;
-
     TargetOptions options = TargetOptions();
     //options.PrintMachineCode = true; //Print machine code produced during JIT compiling
 #if defined(_OS_WINDOWS_) && !defined(_CPU_X86_64_)
@@ -6276,25 +6356,6 @@ extern "C" void *jl_init_llvm(void)
     // to ensure compatibility with GCC codes
     options.StackAlignmentOverride = 16;
 #endif
-    EngineBuilder eb((std::unique_ptr<Module>(engine_module)));
-    std::string ErrorStr;
-    eb  .setEngineKind(EngineKind::JIT)
-        .setTargetOptions(options)
-        // Generate simpler code for JIT
-        .setRelocationModel(Reloc::Static)
-#ifdef _P64
-        // Make sure we are using the large code model on 64bit
-        // Let LLVM pick a default suitable for jitting on 32bit
-        .setCodeModel(CodeModel::Large)
-#elif JL_LLVM_VERSION < 60000
-        .setCodeModel(CodeModel::JITDefault)
-#endif
-#ifdef DISABLE_OPT
-        .setOptLevel(CodeGenOpt::None)
-#else
-        .setOptLevel(jl_options.opt_level == 0 ? CodeGenOpt::None : CodeGenOpt::Aggressive)
-#endif
-    ;
     Triple TheTriple(sys::getProcessTriple());
 #if defined(FORCE_ELF)
     TheTriple.setObjectFormat(Triple::ELF);
@@ -6303,12 +6364,13 @@ extern "C" void *jl_init_llvm(void)
     auto target = jl_get_llvm_target(imaging_mode, target_flags);
     auto &TheCPU = target.first;
     SmallVector<std::string, 10> targetFeatures(target.second.begin(), target.second.end());
+    std::string errorstr;
+    const Target *TheTarget = TargetRegistry::lookupTarget("", TheTriple, errorstr);
+    if (!TheTarget)
+        jl_errorf("%s", errorstr.c_str());
     if (jl_processor_print_help || (target_flags & JL_TARGET_UNKNOWN_NAME)) {
-        std::string errorstr;
-        const Target *target = TargetRegistry::lookupTarget("", TheTriple, errorstr);
-        assert(target);
         std::unique_ptr<MCSubtargetInfo> MSTI(
-            target->createMCSubtargetInfo(TheTriple.str(), "", ""));
+            TheTarget->createMCSubtargetInfo(TheTriple.str(), "", ""));
         if (!MSTI->isCPUStringValid(TheCPU))
             jl_errorf("Invalid CPU name %s.", TheCPU.c_str());
         if (jl_processor_print_help) {
@@ -6318,11 +6380,41 @@ extern "C" void *jl_init_llvm(void)
             MSTI->setDefaultFeatures("help", "");
         }
     }
-    jl_TargetMachine = eb.selectTarget(
-            TheTriple,
-            "",
-            TheCPU,
-            targetFeatures);
+    // Package up features to be passed to target/subtarget
+    std::string FeaturesStr;
+    if (!targetFeatures.empty()) {
+        SubtargetFeatures Features;
+        for (unsigned i = 0; i != targetFeatures.size(); ++i)
+            Features.AddFeature(targetFeatures[i]);
+        FeaturesStr = Features.getString();
+    }
+    // Allocate a target...
+    auto codemodel =
+#ifdef _P64
+        // Make sure we are using the large code model on 64bit
+        // Let LLVM pick a default suitable for jitting on 32bit
+        CodeModel::Large;
+#elif JL_LLVM_VERSION < 60000
+        CodeModel::JITDefault;
+#else
+        CodeModel::Default;
+#endif
+    auto optlevel =
+#ifdef DISABLE_OPT
+        CodeGenOpt::None;
+#else
+        (jl_options.opt_level == 0 ? CodeGenOpt::None : CodeGenOpt::Aggressive);
+#endif
+    jl_TargetMachine = TheTarget->createTargetMachine(
+            TheTriple.getTriple(), TheCPU, FeaturesStr,
+            options,
+            Reloc::Static, // Generate simpler code for JIT
+            codemodel,
+            optlevel
+#if JL_LLVM_VERSION >= 60000
+            , /*JIT*/ true
+#endif
+            );
     assert(jl_TargetMachine && "Failed to select target machine -"
                                " Is the LLVM backend for this CPU enabled?");
     #if (!defined(_CPU_ARM_) && !defined(_CPU_PPC64_))
@@ -6340,16 +6432,16 @@ extern "C" void *jl_init_llvm(void)
     std::string DL = jl_data_layout.getStringRepresentation() + "-ni:10:11:12";
     jl_data_layout.reset(DL);
 #endif
-
-    // Now that the execution engine exists, initialize all modules
-    jl_setup_module(engine_module);
-    jl_setup_module(m);
-    return (void*)m;
 }
 
 extern "C" void jl_init_codegen(void)
 {
-    Module *m = (Module *)jl_init_llvm();
+    jl_init_llvm();
+    // Now that the execution engine exists, initialize all modules
+    jl_init_jit();
+    Module *m = new Module("julia", jl_LLVMContext);
+    shadow_output = m;
+    jl_setup_module(m);
     init_julia_llvm_env(m);
 
     BOX_F(int8,int8);  UBOX_F(uint8,uint8);
@@ -6369,6 +6461,10 @@ extern "C" void jl_init_codegen(void)
     box64_func = boxfunc_llvm(ft2arg(T_pjlvalue, T_pjlvalue, T_int64),
                               "jl_box64", &jl_box64, m);
     jl_init_intrinsic_functions_codegen(m);
+
+    jl_globalPM = new legacy::PassManager();
+    addTargetPasses(jl_globalPM, jl_TargetMachine);
+    addOptimizationPasses(jl_globalPM, jl_options.opt_level);
 }
 
 // the rest of this file are convenience functions

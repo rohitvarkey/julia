@@ -256,7 +256,7 @@ static Constant *literal_static_pointer_val(jl_codectx_t &ctx, const void *p, Ty
 static Value *julia_pgv(jl_codectx_t &ctx, const char *cname, void *addr)
 {
     // emit a GlobalVariable for a jl_value_t named "cname"
-    return jl_get_global_for(cname, addr, jl_Module);
+    return jl_get_global_for(cname, addr, jl_Module, T_pjlvalue);
 }
 
 static Value *julia_pgv(jl_codectx_t &ctx, const char *prefix, jl_sym_t *name, jl_module_t *mod, void *addr)
@@ -2521,7 +2521,7 @@ static Value *emit_defer_signal(jl_codectx_t &ctx)
 
 static int compare_cgparams(const jl_cgparams_t *a, const jl_cgparams_t *b)
 {
-    return (a->cached == b->cached) &&
+    return
            // language features
            (a->track_allocations == b->track_allocations) &&
            (a->code_coverage == b->code_coverage) &&

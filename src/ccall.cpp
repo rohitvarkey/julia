@@ -218,6 +218,8 @@ static DenseMap<AttributeSet,
                 std::map<std::tuple<GlobalVariable*,FunctionType*,
                                     CallingConv::ID>,GlobalVariable*>> allPltMap;
 
+void jl_add_to_shadow(Module *m);
+
 // Emit a "PLT" entry that will be lazily initialized
 // when being called the first time.
 static GlobalVariable *emit_plt_thunk(
@@ -289,6 +291,7 @@ static GlobalVariable *emit_plt_thunk(
     }
     irbuilder.ClearInsertionPoint();
     got = global_proto(got); // exchange got for the permanent global before jl_finalize_module destroys it
+    jl_add_to_shadow(M);
     jl_finalize_module(std::unique_ptr<Module>(M));
 
     auto shadowgot =

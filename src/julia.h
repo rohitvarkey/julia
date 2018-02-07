@@ -1069,6 +1069,9 @@ STATIC_INLINE int jl_is_concrete_type(jl_value_t *v) JL_NOTSAFEPOINT
     return jl_is_datatype(v) && ((jl_datatype_t*)v)->isconcretetype;
 }
 
+JL_DLLEXPORT int jl_is_cacheable_sig(
+    jl_tupletype_t *type, jl_tupletype_t *decl, jl_method_t *definition);
+
 // type constructors
 JL_DLLEXPORT jl_typename_t *jl_new_typename_in(jl_sym_t *name, jl_module_t *inmodule);
 JL_DLLEXPORT jl_tvar_t *jl_new_typevar(jl_sym_t *name, jl_value_t *lb, jl_value_t *ub);
@@ -1422,7 +1425,7 @@ JL_DLLEXPORT const char *jl_pathname_for_handle(void *handle);
 JL_DLLEXPORT int jl_deserialize_verify_header(ios_t *s);
 JL_DLLEXPORT void jl_preload_sysimg_so(const char *fname);
 JL_DLLEXPORT void jl_set_sysimg_so(void *handle);
-JL_DLLEXPORT ios_t *jl_create_system_image(void);
+JL_DLLEXPORT ios_t *jl_create_system_image(void *);
 JL_DLLEXPORT void jl_save_system_image(const char *fname);
 JL_DLLEXPORT void jl_restore_system_image(const char *fname);
 JL_DLLEXPORT void jl_restore_system_image_data(const char *buf, size_t len);
@@ -1784,7 +1787,6 @@ typedef struct {
     const char *bindto;
     const char *outputbc;
     const char *outputunoptbc;
-    const char *outputjitbc;
     const char *outputo;
     const char *outputji;
     int8_t incremental;
@@ -1891,8 +1893,6 @@ typedef struct {
 // codegen interface ----------------------------------------------------------
 
 typedef struct {
-    int cached;             // can the compiler use/populate the compilation cache?
-
     int track_allocations;  // can we track allocations?
     int code_coverage;      // can we measure coverage?
     int static_alloc;       // is the compiler allowed to allocate statically?

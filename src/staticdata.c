@@ -54,6 +54,8 @@ jl_array_t *jl_module_init_order;
 
 // hash of definitions for predefined function pointers
 static htable_t fptr_to_id;
+void *native_functions;
+
 // array of definitions for the predefined function pointers
 // (reverse of fptr_to_id)
 static const jl_fptr_t id_to_fptrs[] = {
@@ -66,16 +68,6 @@ static const jl_fptr_t id_to_fptrs[] = {
     jl_f_applicable, jl_f_invoke, jl_f_sizeof, jl_f__expr,
     NULL };
 
-typedef enum _DUMP_MODES {
-    // not in the serializer at all, or
-    // something is seriously wrong
-    MODE_INVALID = 0,
-
-    // jl_restore_system_image
-    // restoring an entire system image from disk
-    MODE_SYSTEM_IMAGE,
-} DUMP_MODES;
-
 typedef struct {
     ios_t *s;
     ios_t *const_data;
@@ -85,7 +77,6 @@ typedef struct {
     ios_t *fptr_record;
     arraylist_t relocs_list;
     arraylist_t gctags_list;
-    DUMP_MODES mode;
     jl_ptls_t ptls;
 } jl_serializer_state;
 
@@ -660,10 +651,13 @@ static void jl_write_values(jl_serializer_state *s)
                         arraylist_push(&reinit_list, (void*)item);
                         arraylist_push(&reinit_list, (void*)6);
                     }
-                    else if (0 && m->fptr) {
+                    else {
                         // save functionObject pointers
-                        int cfunc = 0;
-                        int func = 0;
+                        uint8_t api = JL_API_NOT_SET;
+                        uint32_t cfunc = 0;
+                        uint32_t func = 0;
+                        if (native_functions)
+                            jl_get_function_id(native_functions, m, &api, &func, &cfunc);
                         assert(reloc_offset < INT32_MAX);
                         if (cfunc != 0) {
                             ios_ensureroom(s->fptr_record, cfunc * sizeof(void*));
@@ -681,9 +675,7 @@ static void jl_write_values(jl_serializer_state *s)
                             write_padding(s->fptr_record, 4);
 #endif
                         }
-                    }
-                    else {
-                        newm->jlcall_api = JL_API_NOT_SET;
+                        newm->jlcall_api = api;
                     }
                 }
             }
@@ -1176,7 +1168,6 @@ static void jl_save_system_image_to_stream(ios_t *f)
     s.relocs = &relocs;
     s.gvar_record = &gvar_record;
     s.fptr_record = &fptr_record;
-    s.mode = MODE_SYSTEM_IMAGE;
     s.ptls = jl_get_ptls_states();
     arraylist_new(&s.relocs_list, 0);
     arraylist_new(&s.gctags_list, 0);
@@ -1294,10 +1285,11 @@ static void jl_save_system_image_to_stream(ios_t *f)
     jl_gc_enable(en);
 }
 
-JL_DLLEXPORT ios_t *jl_create_system_image(void)
+JL_DLLEXPORT ios_t *jl_create_system_image(void *_native_data)
 {
     ios_t *f = (ios_t*)malloc(sizeof(ios_t));
     ios_mem(f, 0);
+    native_functions = _native_data;
     jl_save_system_image_to_stream(f);
     return f;
 }
@@ -1359,7 +1351,6 @@ static void jl_restore_system_image_from_stream(ios_t *f)
     s.relocs = &relocs;
     s.gvar_record = &gvar_record;
     s.fptr_record = &fptr_record;
-    s.mode = MODE_SYSTEM_IMAGE;
     s.ptls = jl_get_ptls_states();
     arraylist_new(&s.relocs_list, 0);
     arraylist_new(&s.gctags_list, 0);

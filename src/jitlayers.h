@@ -35,15 +35,13 @@ extern Function *juliapersonality_func;
 #endif
 
 
-typedef struct {Value *gv; int32_t index;} jl_value_llvm; // uses 1-based indexing
-
 void addTargetPasses(legacy::PassManagerBase *PM, TargetMachine *TM);
 void addOptimizationPasses(legacy::PassManagerBase *PM, int opt_level, bool dump_native=false);
 void* jl_emit_and_add_to_shadow(GlobalVariable *gv, void *gvarinit = NULL);
 void* jl_get_globalvar(GlobalVariable *gv);
-GlobalVariable *jl_get_global_for(const char *cname, void *addr, Module *M);
+GlobalVariable *jl_get_global_for(const char *cname, void *addr, Module *M, Type*);
 void jl_finalize_module(std::unique_ptr<Module>  m);
-
+void jl_merge_module(Module *dest, std::unique_ptr<Module> src);
 
 typedef struct _jl_llvm_functions_t {
     std::string functionObject;     // jlcall llvm Function name
@@ -65,19 +63,26 @@ struct jl_returninfo_t {
 };
 
 typedef std::vector<std::tuple<jl_method_instance_t*, jl_returninfo_t::CallingConv, llvm::Function*, jl_value_t*, bool>> jl_codegen_call_targets_t;
+typedef std::tuple<std::unique_ptr<Module>, jl_llvm_functions_t, jl_value_t*, uint8_t> jl_compile_result_t;
+
 void emit_cfunc_invalidate(
         Function *gf_thunk, jl_returninfo_t::CallingConv cc,
         jl_value_t *calltype, jl_value_t *rettype,
         size_t nargs, size_t world);
 
-std::tuple<std::unique_ptr<Module>, jl_llvm_functions_t, jl_value_t*, uint8_t>
-    jl_compile_linfo1(
+jl_compile_result_t jl_compile_linfo1(
         jl_method_instance_t *li,
         jl_code_info_t *src,
         size_t world,
         jl_codegen_call_targets_t &workqueue,
         bool cache,
         const jl_cgparams_t *params);
+
+void jl_compile_workqueue(
+    size_t world,
+    bool cache,
+    std::map<jl_method_instance_t *, jl_compile_result_t> &emitted,
+    jl_codegen_call_targets_t &workqueue);
 
 // Connect Modules via prototypes, each owned by module `M`
 static inline GlobalVariable *global_proto(GlobalVariable *G, Module *M = NULL)
@@ -115,7 +120,7 @@ static inline void add_named_global(GlobalObject *gv, T *addr, bool dllimport = 
     add_named_global(gv, (void*)(uintptr_t)addr, dllimport);
 }
 
-void jl_init_jit(Type *T_pjlvalue_);
+void jl_init_jit(void);
 #if JL_LLVM_VERSION >= 40000
 typedef JITSymbol JL_JITSymbol;
 // The type that is similar to SymbolInfo on LLVM 4.0 is actually
@@ -184,7 +189,6 @@ public:
     uint64_t getGlobalValueAddress(const std::string &Name);
     uint64_t getFunctionAddress(const std::string &Name);
     StringRef getFunctionAtAddress(uint64_t Addr, jl_method_instance_t *li);
-    Function *FindFunctionNamed(const std::string &Name);
     void RegisterJITEventListener(JITEventListener *L);
     const DataLayout& getDataLayout() const;
     const Triple& getTargetTriple() const;
@@ -209,7 +213,6 @@ private:
     DenseMap<void*, StringRef> ReverseLocalSymbolTable;
 };
 extern JuliaOJIT *jl_ExecutionEngine;
-JL_DLLEXPORT extern LLVMContext jl_LLVMContext;
 
 Pass *createLowerPTLSPass(bool imaging_mode);
 Pass *createCombineMulAddPass();

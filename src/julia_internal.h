@@ -515,7 +515,7 @@ void jl_init_types(void);
 void jl_init_box_caches(void);
 void jl_init_frontend(void);
 void jl_init_primitives(void);
-void *jl_init_llvm(void);
+void jl_init_llvm(void);
 void jl_init_codegen(void);
 void jl_init_intrinsic_functions(void);
 void jl_init_intrinsic_properties(void);
@@ -598,8 +598,13 @@ static inline void jl_set_gc_and_wait(void)
 
 JL_DLLEXPORT jl_value_t *jl_dump_fptr_asm(uint64_t fptr, int raw_mc, const char* asm_variant);
 
-void jl_dump_native(const char *bc_fname, const char *unopt_bc_fname, const char *obj_fname, const char *sysimg_data, size_t sysimg_len);
+void *jl_create_native(jl_array_t *methods);
+void jl_dump_native(void *native_code,
+        const char *bc_fname, const char *unopt_bc_fname, const char *obj_fname,
+        const char *sysimg_data, size_t sysimg_len);
 int32_t jl_get_llvm_gv(jl_value_t *p);
+void jl_get_function_id(void *native_code, jl_method_instance_t *linfo,
+        uint8_t *api, uint32_t *func_idx, uint32_t *specfunc_idx);
 int32_t jl_assign_functionID(const char *fname);
 int32_t jl_jlcall_api(const char *fname);
 // the first argument to jl_idtable_rehash is used to return a value

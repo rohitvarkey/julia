@@ -78,22 +78,7 @@ using namespace llvm;
 
 RTDyldMemoryManager* createRTDyldMemoryManager(void);
 
-static IntegerType *T_uint32;
-static IntegerType *T_uint64;
-static IntegerType *T_size;
-static Type *T_psize;
-static Type *T_pjlvalue;
-void jl_init_jit(Type *T_pjlvalue_)
-{
-    T_uint32 = Type::getInt32Ty(jl_LLVMContext);
-    T_uint64 = Type::getInt64Ty(jl_LLVMContext);
-    if (sizeof(size_t) == 8)
-        T_size = T_uint64;
-    else
-        T_size = T_uint32;
-    T_psize = PointerType::get(T_size, 0);
-    T_pjlvalue = T_pjlvalue_;
-}
+void jl_init_jit(void) { }
 
 // Except for parts of this file which were copied from LLVM, under the UIUC license (marked below).
 
@@ -377,85 +362,13 @@ static jl_generic_fptr_t _jl_compile_linfo(
     assert(src && jl_is_code_info(src));
 
     jl_generic_fptr_t fptr = {};
-    JL_GC_PUSH1(&src);
     // emit the code in LLVM IR form
     jl_codegen_call_targets_t workqueue;
     std::map<jl_method_instance_t *, std::tuple<std::unique_ptr<Module>, jl_llvm_functions_t, jl_value_t*, uint8_t>> emitted;
-    auto result = jl_compile_linfo1(li, src, world, workqueue, true, &jl_default_cgparams);
+    jl_compile_result_t result = jl_compile_linfo1(li, src, world, workqueue, true, &jl_default_cgparams);
     if (std::get<0>(result))
         emitted[li] = std::move(result);
-
-    while (!workqueue.empty()) {
-        jl_llvm_functions_t decls = {};
-        jl_method_instance_t *li;
-        Function *protodecl;
-        jl_returninfo_t::CallingConv proto_cc;
-        bool proto_specsig;
-        jl_value_t *proto_rettype;
-        std::tie(li, proto_cc, protodecl, proto_rettype, proto_specsig) = workqueue.back();
-        workqueue.pop_back();
-        // try to emit code for this item from the workqueue
-        jl_value_t *rettype = li->rettype;
-        if (li->fptr && li->jlcall_api == JL_API_GENERIC) {
-            decls.functionObject = jl_ExecutionEngine->getFunctionAtAddress((uint64_t)(uintptr_t)li->fptr, li);
-            if (li->fptr_specsig)
-                decls.specFunctionObject = jl_ExecutionEngine->getFunctionAtAddress((uint64_t)(uintptr_t)li->fptr_specsig, li);
-        }
-        else {
-            auto &result = emitted[li];
-            if (std::get<0>(result)) {
-                decls = std::get<1>(result);
-                rettype = std::get<2>(result);
-            }
-            else {
-                src = (jl_code_info_t*)li->inferred;
-                if (src && (jl_value_t*)src != jl_nothing) {
-                    if (jl_is_method(li->def.method))
-                        src = jl_uncompress_ast(li->def.method, (jl_array_t*)src);
-                    if (jl_is_code_info(src)) {
-                        result = jl_compile_linfo1(li, src, world, workqueue, true, &jl_default_cgparams);
-                    }
-                }
-                if (std::get<0>(result)) {
-                    decls = std::get<1>(result);
-                    rettype = std::get<2>(result);
-                }
-                else {
-                    emitted.erase(li);
-                }
-            }
-        }
-        // patch up the prototype we emitted earlier
-        Module *mod = protodecl->getParent();
-        StringRef preal_decl = "";
-        assert(protodecl->isDeclaration());
-        if (proto_specsig) {
-            preal_decl = decls.specFunctionObject;
-            if (proto_rettype != rettype || preal_decl.empty()) {
-                protodecl->setLinkage(GlobalVariable::PrivateLinkage);
-                protodecl->addFnAttr("no-frame-pointer-elim", "true");
-                size_t nargs = jl_nparams(li->specTypes); // number of actual arguments being passed
-                emit_cfunc_invalidate(protodecl, proto_cc, li->specTypes, proto_rettype, nargs, world);
-                preal_decl = "";
-            }
-        }
-        else {
-            preal_decl = decls.functionObject;
-            if (preal_decl.empty()) {
-                // TODO: generate an indirect call to li->fptr1 trampoline
-                preal_decl = "jl_apply_2va";
-            }
-        }
-        if (!preal_decl.empty()) {
-            if (Value *specfun = mod->getNamedValue(preal_decl)) {
-                if (protodecl != specfun)
-                    protodecl->replaceAllUsesWith(specfun);
-            }
-            else {
-                protodecl->setName(preal_decl);
-            }
-        }
-    }
+    jl_compile_workqueue(world, true, emitted, workqueue);
 
     for (auto &def : emitted) {
         // Add the results to the execution engine now
@@ -485,7 +398,6 @@ static jl_generic_fptr_t _jl_compile_linfo(
     uint64_t end_time = 0;
     if (dump_compiles_stream != NULL)
         end_time = jl_hrtime();
-    JL_GC_POP();
 
     // If logging of the compilation stream is enabled,
     // then dump the method-instance specialization type to the stream
@@ -1174,11 +1086,6 @@ StringRef JuliaOJIT::getFunctionAtAddress(uint64_t Addr, jl_method_instance_t *l
 }
 
 
-Function *JuliaOJIT::FindFunctionNamed(const std::string &Name)
-{
-    return shadow_output->getFunction(Name);
-}
-
 void JuliaOJIT::RegisterJITEventListener(JITEventListener *L)
 {
     // TODO
@@ -1208,48 +1115,12 @@ std::string JuliaOJIT::getMangledName(const GlobalValue *GV)
 
 JuliaOJIT *jl_ExecutionEngine;
 
-// MSVC's link.exe requires each function declaration to have a Comdat section
-// So rather than litter the code with conditionals,
-// all global values that get emitted call this function
-// and it decides whether the definition needs a Comdat section and adds the appropriate declaration
-// TODO: consider moving this into jl_add_to_shadow or jl_dump_shadow? the JIT doesn't care, so most calls are now no-ops
-template<class T> // for GlobalObject's
-static T *addComdat(T *G)
-{
-#if defined(_OS_WINDOWS_)
-    if (imaging_mode && !G->isDeclaration()) {
-        // Add comdat information to make MSVC link.exe happy
-        // it's valid to emit this for ld.exe too,
-        // but makes it very slow to link for no benefit
-        if (G->getParent() == shadow_output) {
-#if defined(_COMPILER_MICROSOFT_)
-            Comdat *jl_Comdat = G->getParent()->getOrInsertComdat(G->getName());
-            // ELF only supports Comdat::Any
-            jl_Comdat->setSelectionKind(Comdat::NoDuplicates);
-            G->setComdat(jl_Comdat);
-#endif
-#if defined(_CPU_X86_64_)
-            // Add unwind exception personalities to functions to handle async exceptions
-            assert(!juliapersonality_func || juliapersonality_func->getParent() == shadow_output);
-            if (Function *F = dyn_cast<Function>(G))
-                F->setPersonalityFn(juliapersonality_func);
-#endif
-        }
-        // add __declspec(dllexport) to everything marked for export
-        if (G->getLinkage() == GlobalValue::ExternalLinkage)
-            G->setDLLStorageClass(GlobalValue::DLLExportStorageClass);
-        else
-            G->setDLLStorageClass(GlobalValue::DefaultStorageClass);
-    }
-#endif
-    return G;
-}
-
 // destructively move the contents of src into dest
 // this assumes that the targets of the two modules are the same
 // including the DataLayout and ModuleFlags (for example)
 // and that there is no module-level assembly
-static void jl_merge_module(Module *dest, std::unique_ptr<Module> src)
+// Comdat is also removed, since the JIT doesn't need it
+void jl_merge_module(Module *dest, std::unique_ptr<Module> src)
 {
     assert(dest != src.get());
     for (Module::global_iterator I = src->global_begin(), E = src->global_end(); I != E;) {
@@ -1271,8 +1142,8 @@ static void jl_merge_module(Module *dest, std::unique_ptr<Module> src)
         // Reparent the global variable:
         sG->removeFromParent();
         dest->getGlobalList().push_back(sG);
-        // Comdat is owned by the Module, recreate it in the new parent:
-        addComdat(sG);
+        // Comdat is owned by the Module
+        sG->setComdat(nullptr);
     }
 
     for (Module::iterator I = src->begin(), E = src->end(); I != E;) {
@@ -1294,8 +1165,8 @@ static void jl_merge_module(Module *dest, std::unique_ptr<Module> src)
         // Reparent the global variable:
         sG->removeFromParent();
         dest->getFunctionList().push_back(sG);
-        // Comdat is owned by the Module, recreate it in the new parent:
-        addComdat(sG);
+        // Comdat is owned by the Module
+        sG->setComdat(nullptr);
     }
 
     for (Module::alias_iterator I = src->alias_begin(), E = src->alias_end(); I != E;) {
@@ -1328,25 +1199,6 @@ static void jl_merge_module(Module *dest, std::unique_ptr<Module> src)
     }
 }
 
-// clones the contents of the module `m` to the shadow_output collector
-static void jl_add_to_shadow(Module *m)
-{
-#ifndef KEEP_BODIES
-    if (!imaging_mode && !jl_options.outputjitbc)
-        return;
-#endif
-    ValueToValueMapTy VMap;
-    std::unique_ptr<Module> clone(CloneModule(m, VMap));
-    for (Module::iterator I = clone->begin(), E = clone->end(); I != E; ++I) {
-        Function *F = &*I;
-        if (!F->isDeclaration()) {
-            F->setLinkage(Function::InternalLinkage);
-            addComdat(F);
-        }
-    }
-    jl_merge_module(shadow_output, std::move(clone));
-}
-
 static std::unique_ptr<Module> ready_to_emit;
 
 static void jl_add_to_ee()
@@ -1355,6 +1207,7 @@ static void jl_add_to_ee()
     std::unique_ptr<Module> m(std::move(ready_to_emit));
 #if defined(_CPU_X86_64_) && defined(_OS_WINDOWS_)
     // Add special values used by debuginfo to build the UnwindData table registration for Win64
+    Type *T_uint32 = Type::getInt32Ty(ready_to_emit->getContext());
     ArrayType *atype = ArrayType::get(T_uint32, 3); // want 4-byte alignment of 12-bytes of data
     (new GlobalVariable(*m, atype,
         false, GlobalVariable::InternalLinkage,
@@ -1370,7 +1223,6 @@ static void jl_add_to_ee()
 // this passes ownership of a module to the JIT after code emission is complete
 void jl_finalize_module(std::unique_ptr<Module> m)
 {
-    jl_add_to_shadow(m.get());
     if (ready_to_emit)
         jl_merge_module(ready_to_emit.get(), std::move(m));
     else
@@ -1399,48 +1251,6 @@ void add_named_global(GlobalObject *gv, void *addr, bool dllimport)
     jl_ExecutionEngine->addGlobalMapping(gv, addr);
 }
 
-static std::vector<GlobalValue*> jl_sysimg_gvars;
-static std::vector<GlobalValue*> jl_sysimg_fvars;
-static std::map<void*, jl_value_llvm> jl_value_to_llvm;
-
-// global variables to pointers are pretty common,
-// so this method is available as a convenience for emitting them.
-// for other types, the formula for implementation is straightforward:
-// (see stringConstPtr, for an alternative example to the code below)
-//
-// if in imaging_mode, emit a GlobalVariable with the same name and an initializer to the shadow_module
-// making it valid for emission and reloading in the sysimage
-//
-// then add a global mapping to the current value (usually from calloc'd space)
-// to the execution engine to make it valid for the current session (with the current value)
-void* jl_emit_and_add_to_shadow(GlobalVariable *gv, void *gvarinit)
-{
-    PointerType *T = cast<PointerType>(gv->getType()->getElementType()); // pointer is the only supported type here
-
-    GlobalVariable *shadowvar = NULL;
-    if (imaging_mode)
-        shadowvar = global_proto(gv, shadow_output);
-
-    if (shadowvar) {
-        shadowvar->setInitializer(ConstantPointerNull::get(T));
-        shadowvar->setLinkage(GlobalVariable::InternalLinkage);
-        addComdat(shadowvar);
-        if (imaging_mode && gvarinit) {
-            // make the pointer valid for future sessions
-            jl_sysimg_gvars.push_back(shadowvar);
-            jl_value_llvm gv_struct;
-            gv_struct.gv = global_proto(gv);
-            gv_struct.index = jl_sysimg_gvars.size();
-            jl_value_to_llvm[gvarinit] = gv_struct;
-        }
-    }
-
-    // make the pointer valid for this session
-    void *slot = calloc(1, sizeof(void*));
-    jl_ExecutionEngine->addGlobalMapping(gv, slot);
-    return slot;
-}
-
 void* jl_get_globalvar(GlobalVariable *gv)
 {
     void *p = (void*)(intptr_t)jl_ExecutionEngine->getPointerToGlobalIfAvailable(gv);
@@ -1448,209 +1258,9 @@ void* jl_get_globalvar(GlobalVariable *gv)
     return p;
 }
 
-static void emit_offset_table(Module *mod, const std::vector<GlobalValue*> &vars, StringRef name)
-{
-    // Emit a global variable with all the variable addresses.
-    // The cloning pass will convert them into offsets.
-    assert(!vars.empty());
-    size_t nvars = vars.size();
-    std::vector<Constant*> addrs(nvars);
-    for (size_t i = 0; i < nvars; i++)
-        addrs[i] = ConstantExpr::getBitCast(vars[i], T_psize);
-    ArrayType *vars_type = ArrayType::get(T_psize, nvars);
-    new GlobalVariable(*mod, vars_type, true,
-                       GlobalVariable::ExternalLinkage,
-                       ConstantArray::get(vars_type, addrs),
-                       name);
-}
-
-
-static void jl_gen_llvm_globaldata(Module *mod, const char *sysimg_data, size_t sysimg_len)
-{
-    emit_offset_table(mod, jl_sysimg_gvars, "jl_sysimg_gvars");
-    emit_offset_table(mod, jl_sysimg_fvars, "jl_sysimg_fvars");
-    addComdat(new GlobalVariable(*mod,
-                                 T_size,
-                                 true,
-                                 GlobalVariable::ExternalLinkage,
-                                 ConstantInt::get(T_size, globalUnique+1),
-                                 "jl_globalUnique"));
-
-    // reflect the address of the jl_RTLD_DEFAULT_handle variable
-    // back to the caller, so that we can check for consistency issues
-    GlobalValue *jlRTLD_DEFAULT_var = mod->getNamedValue("jl_RTLD_DEFAULT_handle");
-    addComdat(new GlobalVariable(*mod,
-                                 jlRTLD_DEFAULT_var->getType(),
-                                 true,
-                                 GlobalVariable::ExternalLinkage,
-                                 jlRTLD_DEFAULT_var,
-                                 "jl_RTLD_DEFAULT_handle_pointer"));
-
-    if (sysimg_data) {
-        Constant *data = ConstantDataArray::get(jl_LLVMContext,
-            ArrayRef<uint8_t>((const unsigned char*)sysimg_data, sysimg_len));
-        addComdat(new GlobalVariable(*mod, data->getType(), false,
-                                     GlobalVariable::ExternalLinkage,
-                                     data, "jl_system_image_data"))->setAlignment(64);
-        Constant *len = ConstantInt::get(T_size, sysimg_len);
-        addComdat(new GlobalVariable(*mod, len->getType(), true,
-                                     GlobalVariable::ExternalLinkage,
-                                     len, "jl_system_image_size"));
-    }
-}
-
-// takes the running content that has collected in the shadow module and dump it to disk
-// this builds the object file portion of the sysimage files for fast startup
-extern "C"
-void jl_dump_native(const char *bc_fname, const char *unopt_bc_fname, const char *obj_fname, const char *sysimg_data, size_t sysimg_len)
-{
-    JL_TIMING(NATIVE_DUMP);
-    // We don't want to use MCJIT's target machine because
-    // it uses the large code model and we may potentially
-    // want less optimizations there.
-    Triple TheTriple = Triple(jl_TargetMachine->getTargetTriple());
-    // make sure to emit the native object format, even if FORCE_ELF was set in codegen
-#if defined(_OS_WINDOWS_)
-    TheTriple.setObjectFormat(Triple::COFF);
-#elif defined(_OS_DARWIN_)
-    TheTriple.setObjectFormat(Triple::MachO);
-    TheTriple.setOS(llvm::Triple::MacOSX);
-#endif
-    std::unique_ptr<TargetMachine>
-    TM(jl_TargetMachine->getTarget().createTargetMachine(
-        TheTriple.getTriple(),
-        jl_TargetMachine->getTargetCPU(),
-        jl_TargetMachine->getTargetFeatureString(),
-        jl_TargetMachine->Options,
-#if defined(_OS_LINUX_) || defined(_OS_FREEBSD_)
-        Reloc::PIC_,
-#else
-        Optional<Reloc::Model>(),
-#endif
-        // Use small model so that we can use signed 32bits offset in the function and GV tables
-        CodeModel::Small,
-        CodeGenOpt::Aggressive // -O3 TODO: respect command -O0 flag?
-        ));
-
-    legacy::PassManager PM;
-    addTargetPasses(&PM, TM.get());
-
-    // set up optimization passes
-    std::unique_ptr<raw_fd_ostream> unopt_bc_OS;
-    std::unique_ptr<raw_fd_ostream> bc_OS;
-    std::unique_ptr<raw_fd_ostream> obj_OS;
-
-    if (unopt_bc_fname) {
-        // call output handler directly to avoid special case handling of `-` filename
-        int FD;
-        std::error_code EC = sys::fs::openFileForWrite(unopt_bc_fname, FD, sys::fs::F_None);
-        unopt_bc_OS.reset(new raw_fd_ostream(FD, true));
-        std::string err;
-        if (EC)
-            err = "ERROR: failed to open --output-unopt-bc file '" + std::string(unopt_bc_fname) + "': " + EC.message();
-        if (!err.empty())
-            jl_safe_printf("%s\n", err.c_str());
-        else {
-            PM.add(createBitcodeWriterPass(*unopt_bc_OS.get()));
-        }
-    }
-
-    if (bc_fname || obj_fname)
-        addOptimizationPasses(&PM, jl_options.opt_level, true);
-
-    if (bc_fname) {
-        // call output handler directly to avoid special case handling of `-` filename
-        int FD;
-        std::error_code EC = sys::fs::openFileForWrite(bc_fname, FD, sys::fs::F_None);
-        bc_OS.reset(new raw_fd_ostream(FD, true));
-        std::string err;
-        if (EC)
-            err = "ERROR: failed to open --output-bc file '" + std::string(bc_fname) + "': " + EC.message();
-        if (!err.empty())
-            jl_safe_printf("%s\n", err.c_str());
-        else {
-            PM.add(createBitcodeWriterPass(*bc_OS.get()));
-        }
-    }
-
-    if (obj_fname) {
-        // call output handler directly to avoid special case handling of `-` filename
-        int FD;
-        std::error_code EC = sys::fs::openFileForWrite(obj_fname, FD, sys::fs::F_None);
-        obj_OS.reset(new raw_fd_ostream(FD, true));
-        std::string err;
-        if (EC)
-            err = "ERROR: failed to open --output-o file '" + std::string(obj_fname) + "': " + EC.message();
-        if (!err.empty())
-            jl_safe_printf("%s\n", err.c_str());
-        else {
-            if (TM->addPassesToEmitFile(PM, *obj_OS.get(), TargetMachine::CGFT_ObjectFile, false)) {
-                jl_safe_printf("ERROR: target does not support generation of object files\n");
-            }
-        }
-    }
-
-    // Reset the target triple to make sure it matches the new target machine
-    shadow_output->setTargetTriple(TM->getTargetTriple().str());
-#if JL_LLVM_VERSION >= 40000
-    DataLayout DL = TM->createDataLayout();
-    DL.reset(DL.getStringRepresentation() + "-ni:10:11:12");
-    shadow_output->setDataLayout(DL);
-#else
-    shadow_output->setDataLayout(TM->createDataLayout());
-#endif
-
-    // add metadata information
-    if (imaging_mode)
-        jl_gen_llvm_globaldata(shadow_output, sysimg_data, sysimg_len);
-
-    // do the actual work
-    PM.run(*shadow_output);
-    imaging_mode = false;
-}
-
-extern "C" int32_t jl_assign_functionID(const char *fname)
-{
-    // give the function an index in the constant lookup table
-    assert(imaging_mode);
-    if (fname == NULL)
-        return 0;
-    jl_sysimg_fvars.push_back(shadow_output->getNamedValue(fname));
-    return jl_sysimg_fvars.size();
-}
-
-extern "C" int32_t jl_get_llvm_gv(jl_value_t *p)
-{
-    // map a jl_value_t memory location to a GlobalVariable
-    std::map<void*, jl_value_llvm>::iterator it;
-    it = jl_value_to_llvm.find(p);
-    if (it == jl_value_to_llvm.end())
-        return 0;
-    return it->second.index;
-}
-
-GlobalVariable *jl_get_global_for(const char *cname, void *addr, Module *M)
-{
-    // emit a GlobalVariable for a jl_value_t named "cname"
-    std::map<void*, jl_value_llvm>::iterator it;
-    // first see if there already is a GlobalVariable for this address
-    it = jl_value_to_llvm.find(addr);
-    if (it != jl_value_to_llvm.end())
-        return prepare_global_in(M, (llvm::GlobalVariable*)it->second.gv);
-
-    std::stringstream gvname;
-    gvname << cname << globalUnique++;
-    // no existing GlobalVariable, create one and store it
-    GlobalVariable *gv = new GlobalVariable(*M, T_pjlvalue,
-                           false, GlobalVariable::ExternalLinkage,
-                           NULL, gvname.str());
-    *(void**)jl_emit_and_add_to_shadow(gv, addr) = addr;
-    return gv;
-}
 
 // An LLVM module pass that just runs all julia passes in order. Useful for
 // debugging
-extern "C" void jl_init_codegen(void);
 template <int OptLevel>
 class JuliaPipeline : public Pass {
 public:
@@ -1662,7 +1272,7 @@ public:
         void add(Pass *P) { TPM->schedulePass(P); }
     };
     void preparePassManager(PMStack &Stack) override {
-        (void)jl_init_llvm();
+        jl_init_llvm();
         PMTopLevelManager *TPM = Stack.top()->getTopLevelManager();
         TPMAdapter Adapter(TPM);
         addTargetPasses(&Adapter, jl_TargetMachine);
@@ -1679,17 +1289,6 @@ template<> char JuliaPipeline<3>::ID = 0;
 static RegisterPass<JuliaPipeline<0>> X("juliaO0", "Runs the entire julia pipeline (at -O0)", false, false);
 static RegisterPass<JuliaPipeline<2>> Y("julia", "Runs the entire julia pipeline (at -O2)", false, false);
 static RegisterPass<JuliaPipeline<3>> Z("juliaO3", "Runs the entire julia pipeline (at -O3)", false, false);
-
-// the rest of this file are convenience functions
-// that are exported for assisting with debugging from gdb
-// it generally helps to have define KEEP_BODIES (or -g2) if you plan on using this
-extern "C" JL_DLLEXPORT
-void *jl_function_ptr_by_llvm_name(char *name) {
-#ifdef JL_MSAN_ENABLED
-    __msan_unpoison_string(name);
-#endif
-    return (void*)jl_ExecutionEngine->FindFunctionNamed(name); // returns an llvm::Function*
-}
 
 extern "C" JL_DLLEXPORT
 uint64_t jl_get_llvm_fptr(void *function)
