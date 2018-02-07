@@ -67,12 +67,12 @@ namespace llvm {
 #include <llvm/ADT/StringMap.h>
 #include <llvm/ADT/StringSet.h>
 #include <llvm/ADT/SmallSet.h>
-#include "codegen_shared.h"
 
 using namespace llvm;
 
 #include "julia.h"
 #include "julia_internal.h"
+#include "codegen_shared.h"
 #include "jitlayers.h"
 #include "julia_assert.h"
 
@@ -342,31 +342,164 @@ addPassesToGenerateCode(LLVMTargetMachine *TM, PassManagerBase &PM) {
 }
 #endif
 
+// Snooping on which functions are being compiled, and how long it takes
+JL_STREAM *dump_compiles_stream = NULL;
+extern "C" JL_DLLEXPORT
+void jl_dump_compiles(void *s)
+{
+    dump_compiles_stream = (JL_STREAM*)s;
+}
 
-jl_llvm_functions_t jl_compile_linfo(
-        jl_method_instance_t **pli,
-        jl_code_info_t *src JL_MAYBE_UNROOTED,
+static void jl_add_to_ee();
+static uint64_t getAddressForFunction(StringRef fname);
+extern "C" tracer_cb jl_linfo_tracer;
+
+// this generates llvm code for the lambda info
+// and adds the result to the jitlayers
+// (and the shadow module),
+// and generates code for it
+static jl_generic_fptr_t _jl_compile_linfo(
+        jl_method_instance_t *li,
+        jl_code_info_t *src,
         size_t world,
-        const jl_cgparams_t *params);
+        std::vector<jl_method_instance_t*> &triggered_linfos)
+{
+    // caller must hold codegen_lock
+    // and have disabled finalizers
+    JL_TIMING(CODEGEN);
+    uint64_t start_time = 0;
+    if (dump_compiles_stream != NULL)
+        start_time = jl_hrtime();
+
+    assert(jl_is_method_instance(li));
+    assert(li->min_world <= world && (li->max_world >= world || li->max_world == 0) &&
+        "invalid world for method-instance");
+    assert(src && jl_is_code_info(src));
+
+    jl_generic_fptr_t fptr = {};
+    JL_GC_PUSH1(&src);
+    // emit the code in LLVM IR form
+    jl_codegen_call_targets_t workqueue;
+    std::map<jl_method_instance_t *, std::tuple<std::unique_ptr<Module>, jl_llvm_functions_t, jl_value_t*, uint8_t>> emitted;
+    auto result = jl_compile_linfo1(li, src, world, workqueue, true, &jl_default_cgparams);
+    if (std::get<0>(result))
+        emitted[li] = std::move(result);
+
+    while (!workqueue.empty()) {
+        jl_llvm_functions_t decls = {};
+        jl_method_instance_t *li;
+        Function *protodecl;
+        jl_returninfo_t::CallingConv proto_cc;
+        bool proto_specsig;
+        jl_value_t *proto_rettype;
+        std::tie(li, proto_cc, protodecl, proto_rettype, proto_specsig) = workqueue.back();
+        workqueue.pop_back();
+        // try to emit code for this item from the workqueue
+        jl_value_t *rettype = li->rettype;
+        if (li->fptr && li->jlcall_api == JL_API_GENERIC) {
+            decls.functionObject = jl_ExecutionEngine->getFunctionAtAddress((uint64_t)(uintptr_t)li->fptr, li);
+            if (li->fptr_specsig)
+                decls.specFunctionObject = jl_ExecutionEngine->getFunctionAtAddress((uint64_t)(uintptr_t)li->fptr_specsig, li);
+        }
+        else {
+            auto &result = emitted[li];
+            if (std::get<0>(result)) {
+                decls = std::get<1>(result);
+                rettype = std::get<2>(result);
+            }
+            else {
+                src = (jl_code_info_t*)li->inferred;
+                if (src && (jl_value_t*)src != jl_nothing) {
+                    if (jl_is_method(li->def.method))
+                        src = jl_uncompress_ast(li->def.method, (jl_array_t*)src);
+                    if (jl_is_code_info(src)) {
+                        result = jl_compile_linfo1(li, src, world, workqueue, true, &jl_default_cgparams);
+                    }
+                }
+                if (std::get<0>(result)) {
+                    decls = std::get<1>(result);
+                    rettype = std::get<2>(result);
+                }
+                else {
+                    emitted.erase(li);
+                }
+            }
+        }
+        // patch up the prototype we emitted earlier
+        Module *mod = protodecl->getParent();
+        StringRef preal_decl = "";
+        assert(protodecl->isDeclaration());
+        if (proto_specsig) {
+            preal_decl = decls.specFunctionObject;
+            if (proto_rettype != rettype || preal_decl.empty()) {
+                protodecl->setLinkage(GlobalVariable::PrivateLinkage);
+                protodecl->addFnAttr("no-frame-pointer-elim", "true");
+                size_t nargs = jl_nparams(li->specTypes); // number of actual arguments being passed
+                emit_cfunc_invalidate(protodecl, proto_cc, li->specTypes, proto_rettype, nargs, world);
+                preal_decl = "";
+            }
+        }
+        else {
+            preal_decl = decls.functionObject;
+            if (preal_decl.empty()) {
+                // TODO: generate an indirect call to li->fptr1 trampoline
+                preal_decl = "jl_apply_2va";
+            }
+        }
+        if (!preal_decl.empty()) {
+            if (Value *specfun = mod->getNamedValue(preal_decl)) {
+                if (protodecl != specfun)
+                    protodecl->replaceAllUsesWith(specfun);
+            }
+            else {
+                protodecl->setName(preal_decl);
+            }
+        }
+    }
+
+    for (auto &def : emitted) {
+        // Add the results to the execution engine now
+        jl_finalize_module(std::move(std::get<0>(def.second)));
+    }
+    jl_add_to_ee();
+    for (auto &def : emitted) {
+        jl_method_instance_t *this_li = def.first;
+        jl_llvm_functions_t decls = std::get<1>(def.second);
+        jl_value_t *rettype = std::get<2>(def.second);
+        uint8_t api = std::get<3>(def.second);
+        jl_fptr_t addr = (jl_fptr_t)getAddressForFunction(decls.functionObject);
+        if (this_li->jlcall_api == JL_API_NOT_SET) {
+            this_li->fptr = addr;
+            this_li->jlcall_api = api;
+        }
+        if (!decls.specFunctionObject.empty() && rettype == this_li->rettype)
+            this_li->fptr_specsig = (jl_fptr_t)getAddressForFunction(decls.specFunctionObject);
+        if (this_li->compile_traced)
+            triggered_linfos.push_back(this_li);
+        if (this_li == li) {
+            fptr.jlcall_api = api;
+            fptr.fptr = addr;
+        }
+    }
+
+    uint64_t end_time = 0;
+    if (dump_compiles_stream != NULL)
+        end_time = jl_hrtime();
+    JL_GC_POP();
+
+    // If logging of the compilation stream is enabled,
+    // then dump the method-instance specialization type to the stream
+    if (dump_compiles_stream != NULL && jl_is_method(li->def.method)) {
+        jl_printf(dump_compiles_stream, "%" PRIu64 "\t\"", end_time - start_time);
+        jl_static_show(dump_compiles_stream, li->specTypes);
+        jl_printf(dump_compiles_stream, "\"\n");
+    }
+    return fptr;
+}
 
 void jl_strip_llvm_debug(Module *m);
 
-// this ensures that llvmf has been emitted to the execution engine,
-// returning the function pointer to it
-extern void jl_callback_triggered_linfos(void);
-
 Function *jl_cfunction_object(jl_function_t *f, jl_value_t *rt, jl_tupletype_t *argt);
-
-static uint64_t getAddressForFunction(StringRef fname)
-{
-    JL_TIMING(LLVM_EMIT);
-    jl_finalize_function(fname);
-    uint64_t ret = jl_ExecutionEngine->getFunctionAddress(fname);
-    // delay executing trace callbacks until here to make sure there's no
-    // recursive compilation.
-    jl_callback_triggered_linfos();
-    return ret;
-}
 
 // get the address of a C-callable entry point for a function
 extern "C" JL_DLLEXPORT
@@ -375,6 +508,7 @@ void *jl_function_ptr(jl_function_t *f, jl_value_t *rt, jl_value_t *argt)
     JL_GC_PUSH1(&argt);
     JL_LOCK(&codegen_lock);
     Function *llvmf = jl_cfunction_object(f, rt, (jl_tupletype_t*)argt);
+    jl_add_to_ee();
     JL_GC_POP();
     void *ptr = (void*)getAddressForFunction(llvmf->getName());
     JL_UNLOCK(&codegen_lock);
@@ -390,6 +524,7 @@ void jl_extern_c(jl_function_t *f, jl_value_t *rt, jl_value_t *argt, char *name)
     JL_LOCK(&codegen_lock);
     Function *llvmf = jl_cfunction_object(f, rt, (jl_tupletype_t*)argt);
     // force eager emission of the function (llvm 3.3 gets confused otherwise and tries to do recursive compilation)
+    jl_add_to_ee();
     uint64_t Addr = getAddressForFunction(llvmf->getName());
 
     if (imaging_mode)
@@ -405,57 +540,168 @@ void jl_extern_c(jl_function_t *f, jl_value_t *rt, jl_value_t *argt, char *name)
     JL_UNLOCK(&codegen_lock);
 }
 
+
+static jl_generic_fptr_t _jl_generate_fptr(jl_method_instance_t *li, jl_code_info_t *src, size_t world, bool force)
+{
+    jl_generic_fptr_t fptr = {};
+    if (src && jl_is_code_info(src)) {
+        std::vector<jl_method_instance_t*> triggered_linfos;
+        jl_ptls_t ptls = jl_get_ptls_states();
+        jl_gc_enable_finalizers(ptls, 0); // prevent any sort of unexpected recursion
+        // now we need to check again if it was compiled by recursion
+        fptr.jlcall_api = li->jlcall_api;
+        fptr.fptr = li->fptr;
+        if (force || !fptr.fptr || fptr.jlcall_api == JL_API_NOT_SET) {
+            fptr = _jl_compile_linfo(li, src, world, triggered_linfos);
+        }
+        jl_gc_enable_finalizers(ptls, 0);
+        for (jl_method_instance_t *linfo : triggered_linfos) // TODO: would be better to have released the locks first
+            if (jl_linfo_tracer)
+                jl_call_tracer(jl_linfo_tracer, (jl_value_t*)linfo);
+    }
+    return fptr;
+}
+
+// this compiles li and emits fptr
+extern "C"
+jl_generic_fptr_t jl_generate_fptr(jl_method_instance_t **pli, size_t world)
+{
+    jl_method_instance_t *li = *pli;
+    jl_generic_fptr_t fptr;
+    fptr.fptr = li->fptr;
+    fptr.jlcall_api = li->jlcall_api;
+    if (fptr.fptr && fptr.jlcall_api) {
+        return fptr;
+    }
+    JL_LOCK(&codegen_lock);
+    fptr.fptr = li->fptr;
+    fptr.jlcall_api = li->jlcall_api;
+    if (fptr.fptr && fptr.jlcall_api) {
+        JL_UNLOCK(&codegen_lock);
+        return fptr;
+    }
+    // if not already present, see if we have source code
+    // get a CodeInfo object to compile
+    jl_code_info_t *src = NULL;
+    JL_GC_PUSH1(&src);
+    if (!jl_is_method(li->def.method)) {
+        src = (jl_code_info_t*)li->inferred;
+    }
+    else {
+        // If the caller didn't provide the source,
+        // see if it is inferred
+        // or try to infer it for ourself
+        src = (jl_code_info_t*)li->inferred;
+        if (src && (jl_value_t*)src != jl_nothing)
+            src = jl_uncompress_ast(li->def.method, (jl_array_t*)src);
+        if (!src || !jl_is_code_info(src)) {
+            src = jl_type_infer(pli, world, 0);
+            li = *pli;
+        }
+        fptr.fptr = li->fptr;
+        fptr.jlcall_api = li->jlcall_api;
+        if (fptr.fptr && fptr.jlcall_api) {
+            JL_UNLOCK(&codegen_lock); // Might GC
+            JL_GC_POP();
+            return fptr;
+        }
+    }
+    fptr = _jl_generate_fptr(li, src, world, false);
+    JL_UNLOCK(&codegen_lock); // Might GC
+    JL_GC_POP();
+    return fptr;
+}
+
+// this compiles li and emits fptr
+extern "C"
+jl_generic_fptr_t jl_generate_fptr_for_unspecialized(jl_method_instance_t *unspec)
+{
+    assert(jl_is_method(unspec->def.method));
+    jl_generic_fptr_t fptr;
+    fptr.fptr = unspec->fptr;
+    fptr.jlcall_api = unspec->jlcall_api;
+    if (fptr.fptr && fptr.jlcall_api) {
+        return fptr;
+    }
+    JL_LOCK(&codegen_lock);
+    fptr.fptr = unspec->fptr;
+    fptr.jlcall_api = unspec->jlcall_api;
+    if (fptr.fptr && fptr.jlcall_api) {
+        JL_UNLOCK(&codegen_lock); // Might GC
+        return fptr;
+    }
+    jl_code_info_t *src = (jl_code_info_t*)unspec->def.method->source;
+    JL_GC_PUSH1(&src);
+    if (src == NULL) {
+        // TODO: this is wrong
+        assert(unspec->def.method->generator);
+        // TODO: jl_code_for_staged can throw
+        src = jl_code_for_staged(unspec);
+    }
+    if (src && (jl_value_t*)src != jl_nothing)
+        src = jl_uncompress_ast(unspec->def.method, (jl_array_t*)src);
+    fptr.fptr = unspec->fptr;
+    fptr.jlcall_api = unspec->jlcall_api;
+    if (!fptr.fptr || fptr.jlcall_api == JL_API_NOT_SET) {
+        fptr = _jl_generate_fptr(unspec, src, unspec->min_world, false);
+    }
+    JL_UNLOCK(&codegen_lock); // Might GC
+    JL_GC_POP();
+    return fptr;
+}
+
 // get a native disassembly for linfo
 extern "C" JL_DLLEXPORT
 jl_value_t *jl_dump_method_asm(jl_method_instance_t *linfo, size_t world,
-        int raw_mc, char getwrapper, const char* asm_variant, const jl_cgparams_t params)
+        int raw_mc, char getwrapper, const char* asm_variant)
 {
     // printing via disassembly
-    jl_llvm_functions_t decls = {};
-    JL_TRY {
-        decls = jl_compile_linfo(&linfo, NULL, world, &params);
-    } JL_CATCH {
-        decls = {};
-    }
-    if (decls.functionObject == NULL && linfo->jlcall_api == JL_API_CONST && jl_is_method(linfo->def.method)) {
+    jl_generic_fptr_t fptr = {};
+    fptr = jl_generate_fptr(&linfo, world);
+    if (fptr.jlcall_api == JL_API_CONST) {
         // normally we don't generate native code for these functions, so need an exception here
-        // This leaks a bit of memory to cache native code that we'll never actually need
+        // and an extra cache to remember the result
         JL_LOCK(&codegen_lock);
-        decls = linfo->functionObjectsDecls;
-        if (decls.functionObject == NULL) {
+        static DenseMap<jl_method_instance_t *, jl_fptr_t> cache;
+        auto &gen = cache[linfo];
+        if (gen == NULL) {
             jl_code_info_t *src = jl_type_infer(&linfo, world, 0);
             JL_GC_PUSH1(&src);
-            if (!src) {
-                src = linfo->def.method->generator ? jl_code_for_staged(linfo) : (jl_code_info_t*)linfo->def.method->source;
+            if (jl_is_method(linfo->def.method)) {
+                if (!src) {
+                    // TODO: jl_code_for_staged can throw
+                    src = linfo->def.method->generator ? jl_code_for_staged(linfo) : (jl_code_info_t*)linfo->def.method->source;
+                }
+                if (src && (jl_value_t*)src != jl_nothing)
+                    src = jl_uncompress_ast(linfo->def.method, (jl_array_t*)src);
             }
-            decls = jl_compile_linfo(&linfo, src, world, &params);
-            linfo->functionObjectsDecls = decls;
+            fptr.fptr = linfo->fptr;
+            fptr.jlcall_api = linfo->jlcall_api;
+            if (fptr.jlcall_api == JL_API_CONST || fptr.jlcall_api == JL_API_NOT_SET) {
+                fptr = _jl_generate_fptr(linfo, src, world, true);
+            }
+            if (fptr.jlcall_api != JL_API_CONST && fptr.jlcall_api != JL_API_NOT_SET) {
+                gen = fptr.fptr;
+            }
             JL_GC_POP();
         }
         JL_UNLOCK(&codegen_lock);
     }
-    const char *jithandle = decls.functionObject;
-    if (!getwrapper && decls.specFunctionObject)
-        jithandle = decls.specFunctionObject;
-    if (jithandle) {
-        uint64_t fptr = getAddressForFunction(jithandle);
-        // Look in the system image as well
-        if (fptr == 0)
-            fptr = (uintptr_t)jl_ExecutionEngine->getPointerToGlobalIfAvailable(jithandle);
-        if (fptr != 0)
-            return jl_dump_fptr_asm(fptr, raw_mc, asm_variant);
-    }
-    //jl_generic_fptr_t decls = jl_generate_fptr(linfo, NULL, world);
-    //uint64_t fptr = (uintptr_t)decls.fptr;
-    //if (fptr && decls.jlcall_api != JL_API_CONST)
-    //    return jl_dump_fptr_asm(fptr, raw_mc, asm_variant);
 
+    jl_fptr_t specfptr = linfo->fptr_specsig;
+    if (!getwrapper && specfptr) {
+        fptr.fptr = specfptr;
+        fptr.jlcall_api = JL_API_GENERIC;
+    }
+
+    if (fptr.jlcall_api != JL_API_NOT_SET && fptr.jlcall_api != JL_API_CONST && fptr.fptr)
+        return jl_dump_fptr_asm((uint64_t)(uintptr_t)fptr.fptr, raw_mc, asm_variant);
 
     // precise printing via IR assembler
     SmallVector<char, 4096> ObjBufferSV;
     { // scope block
         llvm::raw_svector_ostream asmfile(ObjBufferSV);
-        Function *f = (Function*)jl_get_llvmf_defn(linfo, world, getwrapper, true, params);
+        Function *f = (Function*)jl_get_llvmf_defn(linfo, world, getwrapper, true, jl_default_cgparams);
         assert(!f->isDeclaration());
         std::unique_ptr<Module> m(f->getParent());
         for (auto &f2 : m->functions()) {
@@ -503,129 +749,6 @@ jl_value_t *jl_dump_method_asm(jl_method_instance_t *linfo, size_t world,
         }
     }
     return jl_pchar_to_string(ObjBufferSV.data(), ObjBufferSV.size());
-}
-
-
-static jl_method_instance_t *jl_get_unspecialized(jl_method_instance_t *method)
-{
-    // one unspecialized version of a function can be shared among all cached specializations
-    jl_method_t *def = method->def.method;
-    if (def->source == NULL) {
-        return method;
-    }
-    if (def->unspecialized == NULL) {
-        JL_LOCK(&def->writelock);
-        if (def->unspecialized == NULL) {
-            def->unspecialized = jl_get_specialized(def, def->sig, jl_emptysvec);
-            jl_gc_wb(def, def->unspecialized);
-        }
-        JL_UNLOCK(&def->writelock);
-    }
-    return def->unspecialized;
-}
-
-// this compiles li and emits fptr (optionally given src)
-extern "C"
-jl_generic_fptr_t jl_generate_fptr(jl_method_instance_t *li, jl_code_info_t *src, size_t world)
-{
-    jl_generic_fptr_t fptr;
-    fptr.fptr = li->fptr;
-    fptr.jlcall_api = li->jlcall_api;
-    if (fptr.fptr && fptr.jlcall_api) {
-        return fptr;
-    }
-    fptr.fptr = li->unspecialized_ducttape;
-    fptr.jlcall_api = JL_API_GENERIC;
-    if (!li->inferred && fptr.fptr) {
-        return fptr;
-    }
-    JL_LOCK(&codegen_lock);
-    fptr.fptr = li->fptr;
-    fptr.jlcall_api = li->jlcall_api;
-    if (fptr.fptr && fptr.jlcall_api) {
-        JL_UNLOCK(&codegen_lock);
-        return fptr;
-    }
-    jl_method_instance_t *unspec = NULL;
-    jl_llvm_functions_t decls = li->functionObjectsDecls;
-    const char *F = decls.functionObject;
-    if (!F)
-        F = jl_compile_linfo(&li, src, world, &jl_default_cgparams).functionObject;
-    if (!F && jl_is_method(li->def.method)) {
-        // can't compile F in the JIT right now,
-        // so instead get an unspecialized version
-        // and return its fptr instead
-        // TODO: run this in the interpreter instead
-        if (!F || !jl_can_finalize_function(F)) {
-            if (!unspec)
-                unspec = jl_get_unspecialized(li); // get-or-create the unspecialized version to cache the result
-            jl_code_info_t *src = (jl_code_info_t*)unspec->def.method->source;
-            if (src == NULL) {
-                assert(unspec->def.method->generator);
-                src = jl_code_for_staged(unspec);
-            }
-            fptr.fptr = unspec->fptr;
-            fptr.jlcall_api = unspec->jlcall_api;
-            if (fptr.fptr && fptr.jlcall_api) {
-                JL_UNLOCK(&codegen_lock);
-                return fptr;
-            }
-            jl_llvm_functions_t decls = unspec->functionObjectsDecls;
-            if (unspec == li) {
-                // temporarily clear the decls so that it will compile our unspec version of src
-                unspec->functionObjectsDecls.functionObject = NULL;
-                unspec->functionObjectsDecls.specFunctionObject = NULL;
-            }
-            assert(src);
-            F = jl_compile_linfo(&unspec, src, unspec->min_world, &jl_default_cgparams).functionObject; // this does not change unspec
-            if (!F) {
-                // this should never happen, but will if the compiler crashes
-                // (because of staged functions or llvmcall or other codegen bugs, for example)
-                unspec->fptr = fptr.fptr = (jl_fptr_t)&jl_interpret_call;;
-                unspec->jlcall_api = fptr.jlcall_api = JL_API_INTERPRETED;
-                JL_UNLOCK(&codegen_lock); // Might GC
-                return fptr;
-            }
-            if (unspec == li) {
-                unspec->functionObjectsDecls = decls;
-            }
-            assert(jl_can_finalize_function(F));
-        }
-    }
-    assert(F && "TODO: run code in interpreter");
-    fptr.fptr = (jl_fptr_t)getAddressForFunction(F);
-    fptr.jlcall_api = jl_jlcall_api(F);
-    assert(fptr.fptr != NULL);
-    // decide if the fptr should be cached somewhere also
-    if (unspec) {
-        if (unspec->fptr) {
-            // don't change fptr as that leads to race conditions
-            // with the (not) simultaneous update to jlcall_api
-        }
-        else if (unspec == li) {
-            if (fptr.jlcall_api == JL_API_GENERIC)
-                li->unspecialized_ducttape = fptr.fptr;
-        }
-        else {
-            unspec->jlcall_api = fptr.jlcall_api;
-            unspec->fptr = fptr.fptr;
-        }
-    }
-    else {
-        if (li->fptr) {
-            // don't change fptr as that leads to race conditions
-            // with the (not) simultaneous update to jlcall_api
-        }
-        else if (li->inferred || fptr.jlcall_api != JL_API_GENERIC) {
-            li->jlcall_api = fptr.jlcall_api;
-            li->fptr = fptr.fptr;
-        }
-        else {
-            li->unspecialized_ducttape = fptr.fptr;
-        }
-    }
-    JL_UNLOCK(&codegen_lock); // Might GC
-    return fptr;
 }
 
 // ------------------------ TEMPORARILY COPIED FROM LLVM -----------------
@@ -749,15 +872,14 @@ void JuliaOJIT::DebugObjectRegistrar::registerObject(RTDyldObjHandleT H, const O
         NotifyGDB(SavedObject);
     }
 
+    object::ObjectFile *SavedBinary = SavedObject.getBinary();
     SavedObjects.push_back(std::move(SavedObject));
 
-    ORCNotifyObjectEmitted(JuliaListener.get(), *Object,
-                           *SavedObjects.back().getBinary(),
-                           *LO, JIT.MemMgr.get());
+    ORCNotifyObjectEmitted(JuliaListener.get(), *Object, *SavedBinary, *LO, JIT.MemMgr.get());
 
     // record all of the exported symbols defined in this object
     // in the primary hash table for the enclosing JIT
-    for (auto &Symbol : Object->symbols()) {
+    for (auto &Symbol : SavedBinary->symbols()) {
         auto Flags = Symbol.getFlags();
         if (Flags & object::BasicSymbolRef::SF_Undefined)
             continue;
@@ -772,10 +894,11 @@ void JuliaOJIT::DebugObjectRegistrar::registerObject(RTDyldObjHandleT H, const O
         // as an alternative, we could store the JITSymbol instead
         // (which would present a lazy-initializer functor interface instead)
 #if JL_LLVM_VERSION >= 50000
-        JIT.LocalSymbolTable[Name] = (void*)(uintptr_t)cantFail(Sym.getAddress());
+        void *addr = (void*)(uintptr_t)cantFail(Sym.getAddress());
 #else
-        JIT.LocalSymbolTable[Name] = (void*)(uintptr_t)Sym.getAddress();
+        void *addr = (void*)(uintptr_t)Sym.getAddress();
 #endif
+        JIT.LocalSymbolTable[Name] = addr;
     }
 }
 
@@ -897,6 +1020,12 @@ void *JuliaOJIT::getPointerToGlobalIfAvailable(const GlobalValue *GV)
 
 void JuliaOJIT::addModule(std::unique_ptr<Module> M)
 {
+    std::vector<StringRef> NewExports;
+    for (auto &F : M->functions()) {
+        if (!F.isDeclaration() && F.getLinkage() == GlobalValue::ExternalLinkage) {
+            NewExports.push_back(strdup(F.getName().str().c_str()));
+        }
+    }
 #ifndef JL_NDEBUG
     // validate the relocations for M
     for (Module::iterator I = M->begin(), E = M->end(); I != E; ) {
@@ -964,6 +1093,11 @@ void JuliaOJIT::addModule(std::unique_ptr<Module> M)
 #else
     CompileLayer.emitAndFinalize(modset);
 #endif
+    // record a stable name for this fptr address
+    for (auto Name : NewExports) {
+        void *addr = LocalSymbolTable[getMangledName(Name)];
+        ReverseLocalSymbolTable[addr] = Name;
+    }
 }
 
 void JuliaOJIT::removeModule(ModuleHandleT H)
@@ -983,8 +1117,11 @@ JL_JITSymbol JuliaOJIT::findSymbol(const std::string &Name, bool ExportedSymbols
         Addr = getPointerToGlobalIfAvailable(Name);
     }
     // Step 2: Search all previously emitted symbols
-    if (Addr == nullptr)
-        Addr = LocalSymbolTable[Name];
+    if (Addr == nullptr) {
+        auto it = LocalSymbolTable.find(Name);
+        if (it != LocalSymbolTable.end())
+            Addr = it->second;
+    }
     return JL_JITSymbol((uintptr_t)Addr, JITSymbolFlags::Exported);
 }
 
@@ -1013,6 +1150,30 @@ uint64_t JuliaOJIT::getFunctionAddress(const std::string &Name)
 #endif
 }
 
+StringRef JuliaOJIT::getFunctionAtAddress(uint64_t Addr, jl_method_instance_t *li)
+{
+    auto &fname = ReverseLocalSymbolTable[(void*)(uintptr_t)Addr];
+    if (fname.empty()) {
+        std::stringstream stream_fname;
+        if (li->fptr_specsig) {
+            if (Addr == (uint64_t)(uintptr_t)li->fptr_specsig)
+                stream_fname << "jlsys_"; // the specsig implementation
+            else
+                stream_fname << "jlsysw_"; // it's a specsig wrapper
+        }
+        else {
+            stream_fname << "jsys1_"; // it's a jlcall without a specsig
+        }
+        const char* unadorned_name = jl_symbol_name(li->def.method->name);
+        stream_fname << unadorned_name << "_" << globalUnique++;
+        std::string string_fname = stream_fname.str();
+        fname = strdup(string_fname.c_str());
+        LocalSymbolTable[getMangledName(string_fname)] = (void*)(uintptr_t)Addr;
+    }
+    return fname;
+}
+
+
 Function *JuliaOJIT::FindFunctionNamed(const std::string &Name)
 {
     return shadow_output->getFunction(Name);
@@ -1033,7 +1194,7 @@ const Triple& JuliaOJIT::getTargetTriple() const
     return TM.getTargetTriple();
 }
 
-std::string JuliaOJIT::getMangledName(const std::string &Name)
+std::string JuliaOJIT::getMangledName(StringRef Name)
 {
     SmallString<128> FullName;
     Mangler::getNameWithPrefix(FullName, Name, DL);
@@ -1167,14 +1328,31 @@ static void jl_merge_module(Module *dest, std::unique_ptr<Module> src)
     }
 }
 
-// to finalize a function, look up its name in the `module_for_fname` map of
-// unfinalized functions and merge it, plus any other modules it depends upon,
-// into `collector` then add `collector` to the execution engine
-static StringMap<Module*> module_for_fname;
-static void jl_merge_recursive(Module *m, Module *collector);
-
-static void jl_add_to_ee(std::unique_ptr<Module> m)
+// clones the contents of the module `m` to the shadow_output collector
+static void jl_add_to_shadow(Module *m)
 {
+#ifndef KEEP_BODIES
+    if (!imaging_mode && !jl_options.outputjitbc)
+        return;
+#endif
+    ValueToValueMapTy VMap;
+    std::unique_ptr<Module> clone(CloneModule(m, VMap));
+    for (Module::iterator I = clone->begin(), E = clone->end(); I != E; ++I) {
+        Function *F = &*I;
+        if (!F->isDeclaration()) {
+            F->setLinkage(Function::InternalLinkage);
+            addComdat(F);
+        }
+    }
+    jl_merge_module(shadow_output, std::move(clone));
+}
+
+static std::unique_ptr<Module> ready_to_emit;
+
+static void jl_add_to_ee()
+{
+    JL_TIMING(LLVM_EMIT);
+    std::unique_ptr<Module> m(std::move(ready_to_emit));
 #if defined(_CPU_X86_64_) && defined(_OS_WINDOWS_)
     // Add special values used by debuginfo to build the UnwindData table registration for Win64
     ArrayType *atype = ArrayType::get(T_uint32, 3); // want 4-byte alignment of 12-bytes of data
@@ -1189,92 +1367,19 @@ static void jl_add_to_ee(std::unique_ptr<Module> m)
     jl_ExecutionEngine->addModule(std::move(m));
 }
 
-void jl_finalize_function(StringRef F)
+// this passes ownership of a module to the JIT after code emission is complete
+void jl_finalize_module(std::unique_ptr<Module> m)
 {
-    std::unique_ptr<Module> m(module_for_fname.lookup(F));
-    if (m) {
-        jl_merge_recursive(m.get(), m.get());
-        jl_add_to_ee(std::move(m));
-    }
+    jl_add_to_shadow(m.get());
+    if (ready_to_emit)
+        jl_merge_module(ready_to_emit.get(), std::move(m));
+    else
+        ready_to_emit = std::move(m);
 }
 
-static void jl_finalize_function(const std::string &F, Module *collector)
+static uint64_t getAddressForFunction(StringRef fname)
 {
-    std::unique_ptr<Module> m(module_for_fname.lookup(F));
-    if (m) {
-        jl_merge_recursive(m.get(), collector);
-        jl_merge_module(collector, std::move(m));
-    }
-}
-
-static void jl_merge_recursive(Module *m, Module *collector)
-{
-    // probably not many unresolved declarations, but be sure to iterate over their Names,
-    // since the declarations may get destroyed by the jl_merge_module call.
-    // this is also why we copy the Name string, rather than save a StringRef
-    SmallVector<std::string, 8> to_finalize;
-    for (Module::iterator I = m->begin(), E = m->end(); I != E; ++I) {
-        Function *F = &*I;
-        if (!F->isDeclaration()) {
-            module_for_fname.erase(F->getName());
-        }
-        else if (!isIntrinsicFunction(F)) {
-            to_finalize.push_back(F->getName().str());
-        }
-    }
-
-    for (const auto F : to_finalize) {
-        jl_finalize_function(F, collector);
-    }
-}
-
-// see if any of the functions needed by F are still WIP
-static StringSet<> incomplete_fname;
-static bool can_finalize_function(StringRef F, SmallSet<Module*, 16> &known)
-{
-    if (incomplete_fname.find(F) != incomplete_fname.end())
-        return false;
-    Module *M = module_for_fname.lookup(F);
-    if (M && known.insert(M).second) {
-        for (Module::iterator I = M->begin(), E = M->end(); I != E; ++I) {
-            Function *F = &*I;
-            if (F->isDeclaration() && !isIntrinsicFunction(F)) {
-                if (!can_finalize_function(F->getName(), known))
-                    return false;
-            }
-        }
-    }
-    return true;
-}
-bool jl_can_finalize_function(StringRef F)
-{
-    SmallSet<Module*, 16> known;
-    return can_finalize_function(F, known);
-}
-
-// let the JIT know this function is a WIP
-void jl_init_function(Function *F)
-{
-    incomplete_fname.insert(F->getName());
-}
-
-// this takes ownership of a module after code emission is complete
-// and will add it to the execution engine when required (by jl_finalize_function)
-void jl_finalize_module(Module *m, bool shadow)
-{
-    // record the function names that are part of this Module
-    // so it can be added to the JIT when needed
-    for (Module::iterator I = m->begin(), E = m->end(); I != E; ++I) {
-        Function *F = &*I;
-        if (!F->isDeclaration()) {
-            bool known = incomplete_fname.erase(F->getName());
-            (void)known; // TODO: assert(known); // llvmcall gets this wrong
-            module_for_fname[F->getName()] = m;
-        }
-    }
-    // in the newer JITs, the shadow module is separate from the execution module
-    if (shadow)
-        jl_add_to_shadow(m);
+    return jl_ExecutionEngine->getFunctionAddress(fname);
 }
 
 // helper function for adding a DLLImport (dlsym) address to the execution engine
@@ -1341,25 +1446,6 @@ void* jl_get_globalvar(GlobalVariable *gv)
     void *p = (void*)(intptr_t)jl_ExecutionEngine->getPointerToGlobalIfAvailable(gv);
     assert(p);
     return p;
-}
-
-// clones the contents of the module `m` to the shadow_output collector
-void jl_add_to_shadow(Module *m)
-{
-#ifndef KEEP_BODIES
-    if (!imaging_mode && !jl_options.outputjitbc)
-        return;
-#endif
-    ValueToValueMapTy VMap;
-    std::unique_ptr<Module> clone(CloneModule(m, VMap));
-    for (Module::iterator I = clone->begin(), E = clone->end(); I != E; ++I) {
-        Function *F = &*I;
-        if (!F->isDeclaration()) {
-            F->setLinkage(Function::InternalLinkage);
-            addComdat(F);
-        }
-    }
-    jl_merge_module(shadow_output, std::move(clone));
 }
 
 static void emit_offset_table(Module *mod, const std::vector<GlobalValue*> &vars, StringRef name)

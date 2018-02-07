@@ -229,8 +229,7 @@ static void _compile_all_deq(jl_array_t *found)
     int found_i, found_l = jl_array_len(found);
     jl_printf(JL_STDERR, "found %d uncompiled methods for compile-all\n", (int)found_l);
     jl_method_instance_t *linfo = NULL;
-    jl_value_t *src = NULL;
-    JL_GC_PUSH2(&linfo, &src);
+    JL_GC_PUSH1(&linfo);
     for (found_i = 0; found_i < found_l; found_i++) {
         if (found_i % (1 + found_l / 300) == 0 || found_i == found_l - 1) // show 300 progress steps, to show progress without overwhelming log files
             jl_printf(JL_STDERR, " %d / %d\r", found_i + 1, found_l);
@@ -247,7 +246,6 @@ static void _compile_all_deq(jl_array_t *found)
 
         if (linfo->jlcall_api == JL_API_CONST)
             continue;
-        src = m->source;
         // TODO: the `unspecialized` field is not yet world-aware, so we can't store
         // an inference result there.
         //src = jl_type_infer(&linfo, jl_world_counter, 1);
@@ -259,8 +257,7 @@ static void _compile_all_deq(jl_array_t *found)
         // first try to create leaf signatures from the signature declaration and compile those
         _compile_all_union((jl_value_t*)ml->sig);
         // then also compile the generic fallback
-        jl_generate_ir(linfo, (jl_code_info_t*)src, jl_world_counter);
-        assert(linfo->functionObjectsDecls.functionObject != NULL);
+        (void)jl_generate_fptr_for_unspecialized(linfo);
     }
     JL_GC_POP();
     jl_printf(JL_STDERR, "\n");
@@ -273,8 +270,7 @@ static int compile_all_enq__(jl_typemap_entry_t *ml, void *env)
     jl_method_t *m = ml->func.method;
     if (m->source &&
         (!m->unspecialized ||
-         (m->unspecialized->functionObjectsDecls.functionObject == NULL &&
-          m->unspecialized->jlcall_api != JL_API_CONST &&
+         (m->unspecialized->jlcall_api != JL_API_CONST &&
           m->unspecialized->fptr == NULL))) {
         // found a lambda that still needs to be compiled
         jl_array_ptr_1d_push(found, (jl_value_t*)ml);
@@ -310,9 +306,10 @@ static void jl_compile_all_defs(void)
 static int precompile_enq_specialization_(jl_typemap_entry_t *l, void *closure)
 {
     if (jl_is_method_instance(l->func.value) &&
-            l->func.linfo->functionObjectsDecls.functionObject == NULL &&
-            l->func.linfo->jlcall_api != JL_API_CONST)
+            l->func.linfo->fptr == NULL &&
+            l->func.linfo->jlcall_api != JL_API_CONST) {
         jl_array_ptr_1d_push((jl_array_t*)closure, (jl_value_t*)l->sig);
+    }
     return 1;
 }
 

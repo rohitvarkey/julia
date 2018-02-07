@@ -199,20 +199,6 @@ static uintptr_t jl_fptr_id(void *fptr)
         return *(uintptr_t*)pbp;
 }
 
-int32_t jl_jlcall_api(const char *fname)
-{
-    // give the function an index in the constant lookup table
-    if (fname == NULL)
-        return 0;
-    if (!strncmp(fname, "japi3_", 6)) // jlcall abi 3 from JIT
-        return JL_API_WITH_PARAMETERS;
-    assert(!strncmp(fname, "japi1_", 6) ||  // jlcall abi 1 from JIT
-           !strncmp(fname, "jsys1_", 6) ||  // jlcall abi 1 from sysimg
-           !strncmp(fname, "jlcall_", 7) || // jlcall abi 1 from JIT wrapping a specsig method
-           !strncmp(fname, "jlsysw_", 7));  // jlcall abi 1 from sysimg wrapping a specsig method
-    return JL_API_GENERIC;
-}
-
 
 #define jl_serialize_value(s, v) jl_serialize_value_(s,(jl_value_t*)(v))
 static void jl_serialize_value_(jl_serializer_state *s, jl_value_t *v);
@@ -660,7 +646,7 @@ static void jl_write_values(jl_serializer_state *s)
                 jl_method_instance_t *m = (jl_method_instance_t*)v;
                 jl_method_instance_t *newm = (jl_method_instance_t*)&s->s->buf[reloc_offset];
                 newm->fptr = NULL;
-                newm->unspecialized_ducttape = NULL;
+                newm->fptr_specsig = NULL;
                 if (jl_is_method(m->def.method)) {
                     uintptr_t fptr_id = jl_fptr_id((void*)(uintptr_t)m->fptr);
                     if (m->jlcall_api == JL_API_CONST) {
@@ -674,13 +660,10 @@ static void jl_write_values(jl_serializer_state *s)
                         arraylist_push(&reinit_list, (void*)item);
                         arraylist_push(&reinit_list, (void*)6);
                     }
-                    else if (m->functionObjectsDecls.functionObject) {
-                        int jlcall_api = jl_jlcall_api(m->functionObjectsDecls.functionObject);
-                        assert(jlcall_api);
-                        newm->jlcall_api = jlcall_api;
+                    else if (0 && m->fptr) {
                         // save functionObject pointers
-                        int cfunc = jl_assign_functionID(m->functionObjectsDecls.specFunctionObject);
-                        int func = jl_assign_functionID(m->functionObjectsDecls.functionObject);
+                        int cfunc = 0;
+                        int func = 0;
                         assert(reloc_offset < INT32_MAX);
                         if (cfunc != 0) {
                             ios_ensureroom(s->fptr_record, cfunc * sizeof(void*));
@@ -700,11 +683,9 @@ static void jl_write_values(jl_serializer_state *s)
                         }
                     }
                     else {
-                        newm->jlcall_api = 0;
+                        newm->jlcall_api = JL_API_NOT_SET;
                     }
                 }
-                newm->functionObjectsDecls.functionObject = NULL;
-                newm->functionObjectsDecls.specFunctionObject = NULL;
             }
             else if (jl_is_datatype(v)) {
                 jl_datatype_t *dt = (jl_datatype_t*)v;
@@ -963,7 +944,7 @@ static void jl_update_all_fptrs(jl_serializer_state *s)
             }
             jl_method_instance_t *li = (jl_method_instance_t*)(base + offset);
             if (fvars.base == NULL) {
-                li->jlcall_api = 0;
+                li->jlcall_api = JL_API_NOT_SET;
             }
             else {
                 uintptr_t base = (uintptr_t)fvars.base;

@@ -240,7 +240,6 @@ static GlobalVariable *emit_plt_thunk(
     Function *plt = Function::Create(functype,
                                      GlobalVariable::ExternalLinkage,
                                      fname, M);
-    jl_init_function(plt);
     plt->setAttributes(attrs);
     if (cc != CallingConv::C)
         plt->setCallingConv(cc);
@@ -290,7 +289,7 @@ static GlobalVariable *emit_plt_thunk(
     }
     irbuilder.ClearInsertionPoint();
     got = global_proto(got); // exchange got for the permanent global before jl_finalize_module destroys it
-    jl_finalize_module(M, true);
+    jl_finalize_module(std::unique_ptr<Module>(M));
 
     auto shadowgot =
         cast<GlobalVariable>(shadow_output->getNamedValue(gname));
@@ -1114,11 +1113,9 @@ static jl_cgval_t emit_llvmcall(jl_codectx_t &ctx, jl_value_t **args, size_t nar
         std::stringstream name;
         name << "jl_llvmcall" << llvmcallnumbering++;
         f->setName(name.str());
-        jl_init_function(f);
         f = cast<Function>(prepare_call(function_proto(f)));
     }
     else {
-        jl_init_function(f);
         f->setLinkage(GlobalValue::LinkOnceODRLinkage);
     }
 

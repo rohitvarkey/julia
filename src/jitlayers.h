@@ -42,11 +42,42 @@ void addOptimizationPasses(legacy::PassManagerBase *PM, int opt_level, bool dump
 void* jl_emit_and_add_to_shadow(GlobalVariable *gv, void *gvarinit = NULL);
 void* jl_get_globalvar(GlobalVariable *gv);
 GlobalVariable *jl_get_global_for(const char *cname, void *addr, Module *M);
-void jl_add_to_shadow(Module *m);
-void jl_init_function(Function *f);
-bool jl_can_finalize_function(StringRef F);
-void jl_finalize_function(StringRef F);
-void jl_finalize_module(Module *m, bool shadow);
+void jl_finalize_module(std::unique_ptr<Module>  m);
+
+
+typedef struct _jl_llvm_functions_t {
+    std::string functionObject;     // jlcall llvm Function name
+    std::string specFunctionObject; // specialized llvm Function name
+} jl_llvm_functions_t;
+
+struct jl_returninfo_t {
+    llvm::Function *decl;
+    enum CallingConv {
+        Boxed = 0,
+        Register,
+        SRet,
+        Union,
+        Ghosts
+    } cc;
+    size_t union_bytes;
+    size_t union_align;
+    size_t union_minalign;
+};
+
+typedef std::vector<std::tuple<jl_method_instance_t*, jl_returninfo_t::CallingConv, llvm::Function*, jl_value_t*, bool>> jl_codegen_call_targets_t;
+void emit_cfunc_invalidate(
+        Function *gf_thunk, jl_returninfo_t::CallingConv cc,
+        jl_value_t *calltype, jl_value_t *rettype,
+        size_t nargs, size_t world);
+
+std::tuple<std::unique_ptr<Module>, jl_llvm_functions_t, jl_value_t*, uint8_t>
+    jl_compile_linfo1(
+        jl_method_instance_t *li,
+        jl_code_info_t *src,
+        size_t world,
+        jl_codegen_call_targets_t &workqueue,
+        bool cache,
+        const jl_cgparams_t *params);
 
 // Connect Modules via prototypes, each owned by module `M`
 static inline GlobalVariable *global_proto(GlobalVariable *G, Module *M = NULL)
@@ -152,12 +183,13 @@ public:
     JL_JITSymbol findUnmangledSymbol(const std::string Name);
     uint64_t getGlobalValueAddress(const std::string &Name);
     uint64_t getFunctionAddress(const std::string &Name);
+    StringRef getFunctionAtAddress(uint64_t Addr, jl_method_instance_t *li);
     Function *FindFunctionNamed(const std::string &Name);
     void RegisterJITEventListener(JITEventListener *L);
     const DataLayout& getDataLayout() const;
     const Triple& getTargetTriple() const;
 private:
-    std::string getMangledName(const std::string &Name);
+    std::string getMangledName(StringRef Name);
     std::string getMangledName(const GlobalValue *GV);
 
     TargetMachine &TM;
@@ -174,6 +206,7 @@ private:
     CompileLayerT CompileLayer;
     SymbolTableT GlobalSymbolTable;
     SymbolTableT LocalSymbolTable;
+    DenseMap<void*, StringRef> ReverseLocalSymbolTable;
 };
 extern JuliaOJIT *jl_ExecutionEngine;
 JL_DLLEXPORT extern LLVMContext jl_LLVMContext;

@@ -94,7 +94,7 @@ function _dump_function_linfo_native(linfo::Core.MethodInstance, world::UInt, wr
         throw(ArgumentError("'syntax' must be either :intel or :att"))
     end
     str = ccall(:jl_dump_method_asm, Ref{String},
-                (Any, UInt, Cint, Bool, Ptr{UInt8}, CodegenParams), linfo, world, 0, wrapper, syntax, CodegenParams())
+                (Any, UInt, Cint, Bool, Ptr{UInt8}), linfo, world, 0, wrapper, syntax)
     return str
 end
 
