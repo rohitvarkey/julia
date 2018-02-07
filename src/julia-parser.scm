@@ -2373,9 +2373,14 @@
   (let ((startloc (line-number-node s)) ; be sure to use the line number from the head of the docstring
         (ex (production s)))
     (if (and (doc-string-literal? ex)
-             (let loop ((t (peek-token s)))
+             (let loop ((t  (peek-token s))
+                        (nl #f))
                (cond ((closing-token? t) #f)
-                     ((newline? t) (take-token s) (loop (peek-token s)))
+                     ((newline? t)
+                      (if nl
+                          #f  ;; extra line => not a doc string
+                          (begin (take-token s)
+                                 (loop (peek-token s) #t))))
                      (else #t))))
         `(macrocall (core @doc) ,startloc ,ex ,(production s))
         ex)))

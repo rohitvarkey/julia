@@ -1273,3 +1273,9 @@ let ex = Meta.parse("md\"x\"
     @test Meta.isexpr(ex, :macrocall)
     @test ex.args[1] == Core.GlobalRef(Core, Symbol("@doc"))
 end
+@test Meta.parse("\"x\"
+                  # extra line, not a doc string
+                  f(x) = x", 1)[1] === "x"
+@test Meta.parse("\"x\"
+
+                  f(x) = x", 1)[1] === "x"
