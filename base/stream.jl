@@ -135,29 +135,6 @@ mutable struct PipeEndpoint <: LibuvStream
     end
 end
 
-mutable struct PipeServer <: LibuvServer
-    handle::Ptr{Cvoid}
-    status::Int
-    connectnotify::Condition
-    closenotify::Condition
-    function PipeServer(handle::Ptr{Cvoid}, status)
-        p = new(handle,
-                status,
-                Condition(),
-                Condition())
-        associate_julia_struct(p.handle, p)
-        finalizer(uvfinalize, p)
-        return p
-    end
-end
-
-const LibuvPipe = Union{PipeEndpoint, PipeServer}
-
-function PipeServer()
-    p = PipeServer(Libc.malloc(_sizeof_uv_named_pipe), StatusUninit)
-    return init_pipe!(p; readable=true)
-end
-
 mutable struct TTY <: LibuvStream
     handle::Ptr{Cvoid}
     status::Int
@@ -228,6 +205,8 @@ uvtype(::LibuvStream) = UV_STREAM
 uvhandle(stream::LibuvStream) = stream.handle
 unsafe_convert(::Type{Ptr{Cvoid}}, s::Union{LibuvStream, LibuvServer}) = s.handle
 
+const Sockets_mod = Ref{Module}()
+
 function init_stdio(handle::Ptr{Cvoid})
     t = ccall(:jl_uv_handle_type, Int32, (Ptr{Cvoid},), handle)
     if t == UV_FILE
@@ -238,7 +217,10 @@ function init_stdio(handle::Ptr{Cvoid})
         if t == UV_TTY
             ret = TTY(handle, StatusOpen)
         elseif t == UV_TCP
-            ret = TCPSocket(handle, StatusOpen)
+            if !isassigned(Sockets_mod)
+                Sockets_mod[] = Base.require(Base, :Sockets)
+            end
+            ret = Sockets_mod[].TCPSocket(handle, StatusOpen)
         elseif t == UV_NAMED_PIPE
             ret = PipeEndpoint(handle, StatusOpen)
         else
@@ -611,7 +593,7 @@ show(io::IO, stream::Pipe) = print(io,
 
 ## Functions for PipeEndpoint and PipeServer ##
 
-function init_pipe!(pipe::LibuvPipe;
+function init_pipe!(pipe;
                     readable::Bool = false,
                     writable::Bool = false,
                     julia_only::Bool = true)
@@ -968,110 +950,6 @@ function uv_writecb_task(req::Ptr{Cvoid}, status::Cint)
     end
     nothing
 end
-
-## server functions ##
-
-function accept_nonblock(server::PipeServer,client::PipeEndpoint)
-    if client.status != StatusInit
-        error(client.status == StatusUninit ?
-              "client is not initialized" :
-              "client is already in use or has been closed")
-    end
-    err = ccall(:uv_accept, Int32, (Ptr{Cvoid}, Ptr{Cvoid}), server.handle, client.handle)
-    if err == 0
-        client.status = StatusOpen
-    end
-    return err
-end
-
-function accept_nonblock(server::PipeServer)
-    client = init_pipe!(PipeEndpoint(); readable=true, writable=true, julia_only=true)
-    uv_error("accept", accept_nonblock(server, client) != 0)
-    return client
-end
-
-function accept(server::LibuvServer, client::LibuvStream)
-    if server.status != StatusActive
-        throw(ArgumentError("server not connected, make sure \"listen\" has been called"))
-    end
-    while isopen(server)
-        err = accept_nonblock(server, client)
-        if err == 0
-            return client
-        elseif err != UV_EAGAIN
-            uv_error("accept", err)
-        end
-        stream_wait(server, server.connectnotify)
-    end
-    uv_error("accept", UV_ECONNABORTED)
-end
-
-const BACKLOG_DEFAULT = 511
-
-function listen(sock::LibuvServer; backlog::Integer=BACKLOG_DEFAULT)
-    uv_error("listen", trylisten(sock))
-    return sock
-end
-
-function trylisten(sock::LibuvServer; backlog::Integer=BACKLOG_DEFAULT)
-    check_open(sock)
-    err = ccall(:uv_listen, Cint, (Ptr{Cvoid}, Cint, Ptr{Cvoid}),
-                sock, backlog, uv_jl_connectioncb::Ptr{Cvoid})
-    sock.status = StatusActive
-    return err
-end
-
-function bind(server::PipeServer, name::AbstractString)
-    @assert server.status == StatusInit
-    err = ccall(:uv_pipe_bind, Int32, (Ptr{Cvoid}, Cstring),
-                server, name)
-    if err != 0
-        if err != UV_EADDRINUSE && err != UV_EACCES
-            #TODO: this codepath is currently not tested
-            throw(UVError("bind",err))
-        else
-            return false
-        end
-    end
-    server.status = StatusOpen
-    return true
-end
-
-"""
-    listen(path::AbstractString) -> PipeServer
-
-Create and listen on a named pipe / UNIX domain socket.
-"""
-function listen(path::AbstractString)
-    sock = PipeServer()
-    bind(sock, path) || throw(ArgumentError("could not listen on path $path"))
-    return listen(sock)
-end
-
-function connect!(sock::PipeEndpoint, path::AbstractString)
-    @assert sock.status == StatusInit
-    req = Libc.malloc(_sizeof_uv_connect)
-    uv_req_set_data(req, C_NULL)
-    ccall(:uv_pipe_connect, Cvoid, (Ptr{Cvoid}, Ptr{Cvoid}, Cstring, Ptr{Cvoid}), req, sock.handle, path, uv_jl_connectcb::Ptr{Cvoid})
-    sock.status = StatusConnecting
-    return sock
-end
-
-function connect(sock::LibuvStream, args...)
-    connect!(sock, args...)
-    wait_connected(sock)
-    return sock
-end
-
-# Libuv will internally reset read/writability, which is uses to
-# mark that this is an invalid pipe.
-
-"""
-    connect(path::AbstractString) -> PipeEndpoint
-
-Connect to the named pipe / UNIX domain socket at `path`.
-"""
-connect(path::AbstractString) = connect(init_pipe!(PipeEndpoint(); readable=false, writable=false, julia_only=true),path)
 
 const OS_HANDLE = Sys.iswindows() ? WindowsRawSocket : RawFD
 const INVALID_OS_HANDLE = Sys.iswindows() ? WindowsRawSocket(Ptr{Cvoid}(-1)) : RawFD(-1)

@@ -1,6 +1,4 @@
-precompile(Tuple{typeof(Serialization.write_as_tag), Base.TCPSocket, Int32})
 precompile(Tuple{typeof(Serialization.object_number), Core.TypeName})
-precompile(Tuple{typeof(Serialization.serialize_array_data), Base.TCPSocket, Array{Int64, 1}})
 precompile(Tuple{typeof(Serialization.deserialize_array), Serialization.Serializer{Base.PipeEndpoint}})
 precompile(Tuple{typeof(Serialization.deserialize), Base.PipeEndpoint})
 precompile(Tuple{typeof(Serialization.deserialize), Serialization.Serializer{Base.PipeEndpoint}})
